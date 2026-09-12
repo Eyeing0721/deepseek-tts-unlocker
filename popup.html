@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; width: 320px; font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; padding: 12px 14px 14px; }
+  h1 { font-size: 14px; margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #c9c9c9; display: inline-block; }
+  .dot.on { background: #22c55e; }
+  .dot.off { background: #ef4444; }
+  .row { margin: 6px 0; }
+  .muted { opacity: .65; }
+  code { background: rgba(127,127,127,.18); padding: 0 4px; border-radius: 3px; }
+  select, button { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(127,127,127,.45); background: transparent; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #models { margin: 4px 0 0; padding-left: 16px; }
+  #models li { margin: 1px 0; }
+  .ok { color: #22c55e; } .bad { color: #ef4444; }
+  hr { border: 0; border-top: 1px solid rgba(127,127,127,.25); margin: 10px 0; }
+</style>
+</head>
+<body>
+  <h1><span id="dot" class="dot"></span>DeepSeek 朗读解锁</h1>
+
+  <div class="row" id="page">检测页面…</div>
+  <div class="row" id="gray"></div>
+
+  <hr>
+
+  <div class="row">
+    <label class="muted" for="voice">朗读音色</label><br>
+    <select id="voice" disabled><option>加载中…</option></select>
+    <button id="save" disabled>保存</button>
+  </div>
+  <div class="row" id="msg" class="muted"></div>
+
+  <hr>
+  <div class="row">
+    <button id="reset">清掉本地缓存并刷新（还原）</button>
+  </div>
+  <div class="row muted">
+    装好插件后<strong>刷新一次</strong> DeepSeek 页面，每条回答下方就会出现「朗读」按钮，用的是官方播放器。
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

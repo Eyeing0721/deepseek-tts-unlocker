@@ -1,0 +1,13 @@
+# 打包产物 / 本地测试文件，不入库
+*.zip
+*.wav
+*.opus
+*.crx
+*.pem
+*.key
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini
+node_modules/
