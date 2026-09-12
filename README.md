@@ -22,7 +22,7 @@
 - **前端侧**：装好插件、刷新页面后，回答下方出现喇叭入口（见上图，比原来多出来的那一个就是「朗读」）。
 
 > 关于磁盘：补丁本身只在内存里生效，但官方前端有时会把读到的那份配置回写进 localStorage
-> （版本号变成 81+1=82）。结果就是**卸载插件后按钮可能还在**，直到官方下次下发新版本号。
+> （例如 81 变成 1081）。插件的 `setItem` 会把抬高的部分减回去，所以磁盘通常仍是官方原值；万一被回写，**卸载插件后按钮可能留到官方下次下发新版本号**。
 > 想立刻恢复原样，点插件里的「清掉本地缓存并刷新（还原）」或书签②即可。
 
 
@@ -69,7 +69,7 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 | 文件 | 作用 |
 |---|---|
-| `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里 +1，挡住本次会话的服务端覆盖。不主动写存储。 |
+| `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里抬高 1000 挡住服务端覆盖；`setItem` 里再减回去，磁盘保持官方原值。 |
 | `bridge.js` | 隔离世界脚本，读同源 `localStorage.userToken`，代弹窗调用 `/api/v0/chat/tts/voices`、`/api/v0/chat/tts/voice`、`/api/v0/auth/ticket`。 |
 | `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色。 |
 
@@ -116,4 +116,5 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 - `tools/console-probe.js`：控制台版探针 + 逆向出的完整协议备忘（票据、WebSocket 帧格式、错误码、音色字段），
   想自己写脚本或排查问题时看它。
+
 
