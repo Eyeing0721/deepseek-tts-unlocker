@@ -6,6 +6,8 @@
 > 🎬 演示视频（B 站）：https://www.bilibili.com/video/BV1bxYo6tELF/
 >
 > 📱 安卓 App 同样解锁：https://github.com/Eyeing0721/deepseek-apk-tts-unlock
+>
+> 📦 **下载**：[Releases](https://github.com/Eyeing0721/deepseek-tts-unlocker/releases/latest) —— Chrome/Edge 拿 `-chrome.zip`，Firefox 拿 `-firefox.xpi`
 
 让**没有被灰度到「朗读 / TTS」的 DeepSeek 网页版账号**也能用上官方朗读功能。
 
@@ -170,6 +172,7 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 - `tools/console-probe.js`：控制台版探针 + 逆向出的完整协议备忘（票据、WebSocket 帧格式、错误码、音色字段），
   想自己写脚本或排查问题时看它。
+
 
 
 
