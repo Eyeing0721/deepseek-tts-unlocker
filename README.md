@@ -1,7 +1,7 @@
 # DeepSeek 朗读解锁（浏览器插件）
 
 > Unlock the official **Read aloud (TTS)** button on `chat.deepseek.com` for accounts outside the grey release.
-> Chrome / Edge MV3 extension · only flips a local client-side flag · talks to the official API with your own account.
+> Chrome / Edge **/ Firefox** MV3 extension · only flips a local client-side flag · talks to the official API with your own account.
 >
 > 🎬 演示视频（B 站）：https://www.bilibili.com/video/BV1bxYo6tELF/
 
@@ -30,20 +30,64 @@
 
 ---
 
-## 一、安装（Chrome / Edge，1 分钟）
+## 一、安装
+
+先打包（可选，仓库里已经带了成品）：
+
+```powershell
+pwsh -File build.ps1
+# dist/deepseek-tts-unlocker-chrome.zip
+# dist/deepseek-tts-unlocker-firefox.xpi
+```
+
+### Chrome / Edge（1 分钟）
 
 1. 下载/拷贝整个 `deepseek-tts-unlocker` 文件夹到本机任意位置（解压后不要删）。
 2. 打开扩展管理页：
    - Edge：地址栏输入 `edge://extensions`
    - Chrome：地址栏输入 `chrome://extensions`
 3. 打开右下角（Chrome 是右上角）的 **开发者模式**。
-4. 点 **加载已解压的扩展程序** → 选中 `deepseek-tts-unlocker` 这个文件夹。
+4. 点 **加载已解压的扩展程序** → 选中 `deepseek-tts-unlocker` 这个文件夹（或 `dist/chrome`）。
 5. 回到 `chat.deepseek.com`，**刷新一次页面**。
+
+> 要求 Chrome / Edge 111 及以上（用到 MV3 的 `world: "MAIN"`）。现在的浏览器都满足。
 
 每条 AI 回答下面就会出现「朗读」按钮，点它就能听；设置页里也会多出「朗读音色」。
 点工具栏上的插件图标可以看状态和换音色。
 
-> 要求 Chrome / Edge 111 及以上（用到 MV3 的 `world: "MAIN"`）。现在的浏览器都满足。
+### Firefox（要求 Firefox 140+）
+
+Firefox 版本包在 `dist/deepseek-tts-unlocker-firefox.xpi`（一个 zip，只是扩展名不同）。
+Firefox 的扩展要签名才能**永久**安装，所以有三种走法，挑一个：
+
+**① 临时加载（最快，重启浏览器后失效 —— 适合先试试）**
+
+1. 地址栏输入 `about:debugging#/runtime/this-firefox`
+2. 点 **临时载入附加组件…**
+3. 选 `dist/firefox/manifest.json`（解压 `dist/firefox/` 后选里面的 manifest.json 也行）
+4. 回到 `chat.deepseek.com`，刷新一次
+
+**② 装成正式扩展（长期用，需要 Firefox Developer Edition 或 Nightly）**
+
+1. `about:config` → 搜 `xpinstall.signatures.required` → 改成 `false`
+2. `about:addons` → 右上齿轮 → **从文件安装附加组件** → 选 `deepseek-tts-unlocker-firefox.xpi`
+
+> 正式版 Firefox 会忽略上面那个开关（Mozilla 只在 Dev/Nightly/ESR 上允许关签名校验），
+> 所以想在**正式版**里永久安装，走 ③。
+
+**③ 上 AMO 自助签名（免费，签完正式版也能永久装）**
+
+把 `dist/deepseek-tts-unlocker-firefox.xpi` 传到 [addons.mozilla.org/developers](https://addons.mozilla.org/developers/)
+选「On your own」（self-distribution）走一遍自动签名，下载签名后的 xpi 安装即可。不上架也能签。
+
+**Firefox 的一个坑**：Firefox 把「站点访问权限」当成可选权限，装完不一定自动给。
+装好后点一下插件图标，如果显示 **「还差一步：允许本扩展访问 chat.deepseek.com」**，
+点那个授权按钮即可（或者去 `about:addons` → 本扩展 → 权限 → 允许站点访问）。
+
+> 实测（Firefox Developer Edition 156，headless，geckodriver 0.36）：
+> 在真实的 `chat.deepseek.com` 上，主世界注入 ✓、读配置补 `tts_feature` ✓、
+> 版本号 81→1081 抬高 ✓、写盘时减回去 ✓（4/4 通过）。
+> `web-ext lint` 也是 0 error。
 
 ## 二、不装插件也行：书签版（零安装，任何浏览器）
 
@@ -71,9 +115,15 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 | 文件 | 作用 |
 |---|---|
-| `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里抬高 1000 挡住服务端覆盖；`setItem` 里再减回去，磁盘保持官方原值。 |
+| `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里抬高 1000 挡住服务端覆盖；`setItem` 里再减回去，磁盘保持官方原值。**Chrome 和 Firefox 共用同一份。** |
 | `bridge.js` | 隔离世界脚本，读同源 `localStorage.userToken`，代弹窗调用 `/api/v0/chat/tts/voices`、`/api/v0/chat/tts/voice`、`/api/v0/auth/ticket`。 |
-| `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色。 |
+| `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色。Firefox 下还会检查站点权限并提供一键授权。 |
+| `manifest.json` | Chrome / Edge 的清单（MV3）。 |
+| `manifest.firefox.json` | Firefox 的清单（MV3 + `browser_specific_settings`），比 Chrome 版多一个 `optional_host_permissions` 用于运行时授权。 |
+| `build.ps1` | 一份源码 → `dist/` 下 Chrome zip 与 Firefox xpi。 |
+
+跨浏览器用到同一条 MV3 能力：`content_scripts[].world = "MAIN"`（Chrome 111+ / Firefox 128+，Firefox 包声明的是 140+）。
+脚本里所有扩展 API 都走 `browser.* ?? chrome.*` 的兼容写法。
 
 只用到一个权限：`https://chat.deepseek.com/*`。不发任何外部请求，不收集数据。
 

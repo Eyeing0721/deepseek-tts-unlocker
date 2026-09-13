@@ -1,10 +1,16 @@
-# 打包产物 / 本地测试文件，不入库
-*.zip
+# 临时/本地文件，不入库
 *.wav
 *.opus
 *.crx
 *.pem
 *.key
+/*.zip
+
+# 打包成品（dist/ 里的要入库，方便别人直接下载 / 加载）
+*.zip
+*.xpi
+!dist/*.zip
+!dist/*.xpi
 
 # 系统杂项
 .DS_Store
