@@ -69,6 +69,93 @@
     return origSetItem.call(this, key, value);
   };
 
+  /* 会话历史兜底：页面自己拉 /chat/history_messages 时顺手存一份，
+   * 隔离世界（bridge.js）取不到时可以用它，避免接口参数/版本差异导致空列表。
+   */
+  let capturedMessages = null; // { sessionId, map: Map<id, message>, order: string[] }
+
+  function sessionOf(url) {
+    try {
+      const m = String(url || '').match(/[?&]chat_session_id=([^&]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    } catch { return null; }
+  }
+
+  function captureHistory(url, json) {
+    try {
+      const biz = json && json.data && json.data.biz_data;
+      const list = biz && (biz.chat_messages || biz.messages);
+      if (!Array.isArray(list)) return;
+      const sessionId = sessionOf(url);
+      // 换会话就重新收集；同一会话的 MERGE 增量按 message_id 合并
+      if (!capturedMessages || capturedMessages.sessionId !== sessionId) {
+        capturedMessages = { sessionId, map: new Map(), order: [] };
+      }
+      for (const m of list) {
+        const id = m && (m.message_id != null ? m.message_id : m.id);
+        if (id == null) continue;
+        const key = String(id);
+        if (!capturedMessages.map.has(key)) capturedMessages.order.push(key);
+        capturedMessages.map.set(key, m);
+      }
+      while (capturedMessages.order.length > 200) {
+        capturedMessages.map.delete(capturedMessages.order.shift());
+      }
+    } catch { /* 忽略 */ }
+  }
+
+  function capturedList() {
+    if (!capturedMessages) return null;
+    return capturedMessages.order.map((key) => capturedMessages.map.get(key)).filter(Boolean);
+  }
+
+  const origFetch = window.fetch;
+  if (typeof origFetch === 'function') {
+    window.fetch = function (...args) {
+      const promise = origFetch.apply(this, args);
+      try {
+        const input = args[0];
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (url.includes('/api/v0/chat/history_messages')) {
+          promise.then((res) => {
+            try {
+              res.clone().json().then((json) => captureHistory(url, json)).catch(() => {});
+            } catch { /* body 已被消费 */ }
+          }, () => {});
+        }
+      } catch { /* 忽略 */ }
+      return promise;
+    };
+  }
+
+  const origXhrOpen = XMLHttpRequest.prototype.open;
+  const origXhrSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    try { this.__dsTtsUrl = String(url || ''); } catch { /* 忽略 */ }
+    return origXhrOpen.call(this, method, url, ...rest);
+  };
+  XMLHttpRequest.prototype.send = function (...args) {
+    try {
+      if (String(this.__dsTtsUrl || '').includes('/api/v0/chat/history_messages')) {
+        this.addEventListener('load', () => {
+          try { captureHistory(this.__dsTtsUrl, JSON.parse(this.responseText)); } catch { /* 忽略 */ }
+        });
+      }
+    } catch { /* 忽略 */ }
+    return origXhrSend.apply(this, args);
+  };
+
+  window.addEventListener('message', (ev) => {
+    if (ev.source !== window) return;
+    const data = ev.data;
+    if (!data || data.__dsTtsUnlock !== 'getMessages') return;
+    window.postMessage({
+      __dsTtsUnlock: 'messages',
+      sessionId: capturedMessages ? capturedMessages.sessionId : null,
+      messages: capturedList(),
+    }, '*');
+  });
+
   document.documentElement.setAttribute('data-ds-tts-unlock', '1');
   window.postMessage({ __dsTtsUnlock: 'installed' }, '*');
 })();

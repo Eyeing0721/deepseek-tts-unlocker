@@ -1,0 +1,10 @@
+{
+  "appName": {
+    "message": "DeepSeek Read Aloud Unlock",
+    "description": "Extension name"
+  },
+  "appDesc": {
+    "message": "Enables the official Read aloud (TTS) button on the DeepSeek web app for accounts outside the rollout. Runs locally and does not change account data.",
+    "description": "Extension description"
+  }
+}

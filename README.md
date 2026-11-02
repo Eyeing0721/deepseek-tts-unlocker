@@ -8,6 +8,8 @@
 > 📱 安卓 App 同样解锁：https://github.com/Eyeing0721/deepseek-apk-tts-unlock
 >
 > 📦 **下载**：[Releases](https://github.com/Eyeing0721/deepseek-tts-unlocker/releases/latest) —— Chrome/Edge 拿 `-chrome.zip`，Firefox 拿 `-firefox.xpi`
+>
+> 🇷🇺 **Русский интерфейс**: в попапе расширения выберите «Русский» в поле «Язык интерфейса». Рядом выбирается «Язык озвучки» — он влияет на названия голосов и официальные примеры; само чтение идёт на языке ответа. Экспорт диалога: MP3/WAV, отдельные голоса для DeepSeek и ваших сообщений. Есть опция «SRT-субтитры» — для сборки видео локально через ffmpeg; текст диалога никуда не отправляется.
 
 让**没有被灰度到「朗读 / TTS」的 DeepSeek 网页版账号**也能用上官方朗读功能。
 
@@ -119,9 +121,12 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 | 文件 | 作用 |
 |---|---|
-| `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里抬高 1000 挡住服务端覆盖；`setItem` 里再减回去，磁盘保持官方原值。**Chrome 和 Firefox 共用同一份。** |
-| `bridge.js` | 隔离世界脚本，读同源 `localStorage.userToken`，代弹窗调用 `/api/v0/chat/tts/voices`、`/api/v0/chat/tts/voice`、`/api/v0/auth/ticket`。 |
-| `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色。Firefox 下还会检查站点权限并提供一键授权。 |
+| `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里抬高 1000 挡住服务端覆盖；`setItem` 里再减回去，磁盘保持官方原值。另外顺手截获官方前端自己请求的 `history_messages`，给下载列表做兜底。**Chrome 和 Firefox 共用同一份。** |
+| `bridge.js` | 隔离世界脚本，读同源 `localStorage.userToken`，代弹窗调用 `/api/v0/chat/tts/voices`、`/api/v0/chat/tts/voice`、`/api/v0/auth/ticket`、`/api/v0/chat/history_messages`；导出的任务（逐条合成、MP3/WAV 编码、保存文件）都在这里跑，弹窗关掉也不中断。 |
+| `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色、选择界面语言与朗读语言（含官方试听）、下载 MP3/WAV、按「DeepSeek / 你」分配音色、整段对话合成（含进度与取消）。Firefox 下还会检查站点权限并提供一键授权。 |
+| `i18n.js` | 弹窗文案表（中文 / English / Русский）与音色名称、描述的兜底翻译。加一门界面语言只需在这里加一项。 |
+| `lamejs.min.js` | 内置 MP3 编码器（lamejs 1.2.1，LGPL-3.0，未修改，可独立替换），作为 content script 注入。许可证见 `LICENSE-lamejs.txt`。 |
+| `_locales/` | 清单本地化（`zh_CN` / `en` / `ru`，默认 `en`），让浏览器工具栏和商店里的扩展名称、描述跟随浏览器语言。 |
 | `manifest.json` | Chrome / Edge 的清单（MV3）。 |
 | `manifest.firefox.json` | Firefox 的清单（MV3 + `browser_specific_settings`），比 Chrome 版多一个 `optional_host_permissions` 用于运行时授权。 |
 | `build.ps1` | 一份源码 → `dist/` 下 Chrome zip 与 Firefox xpi。 |
@@ -129,7 +134,81 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 跨浏览器用到同一条 MV3 能力：`content_scripts[].world = "MAIN"`（Chrome 111+ / Firefox 128+，Firefox 包声明的是 140+）。
 脚本里所有扩展 API 都走 `browser.* ?? chrome.*` 的兼容写法。
 
-只用到一个权限：`https://chat.deepseek.com/*`。不发任何外部请求，不收集数据。
+### 界面语言 / 朗读语言
+
+弹窗顶部有两个下拉框，选择会存在扩展自己的 `localStorage` 里，下次打开继续生效：
+
+- **界面语言**：中文 / English / Русский。首次打开按浏览器界面语言自动选择，之后记住手动选择。
+- **朗读语言**：决定音色名称、描述和「试听」按钮用哪种语言，并标注当前音色是否支持该语言
+  （不支持时选项后面会有 ⚠）。可选语言来自官方 `/tts/voices` 返回的 `languages` / `demo_urls`。
+  注意：**实际朗读的语言由回答原文决定**，插件无法让服务端把中文回答改用俄语朗读；
+  这个选项帮你挑一个支持目标语言的音色，并能直接听该语言的官方样例。
+
+### 下载音频（MP3 / WAV，按角色配音）
+
+弹窗里的「下载音频」区块会从 `/api/v0/chat/history_messages` 读取当前会话最近 400 条消息。
+读取时兼容当前接口的 `fragments[].content`（正文在 fragment 里，消息级 `content` 是老格式），
+并带 `cache_version=0` 强制拿全量快照，避免服务端返回 `MERGE` 增量（0 条）。
+如果插件直连接口没拿到消息（比如官方接口参数变了），会自动改用**官方前端自己请求的那份历史**
+（`inject.js` 在主世界截获 `fetch` / XHR 的响应），所以只要页面上能看到对话，列表通常就能出来。
+合成走官方同款流程：`POST /api/v0/auth/ticket {scope:"tts"}` 取一次性票 →
+`wss://chat.deepseek.com/api/v0/chat/tts/?...&format=pcm` 收 24 kHz 单声道 s16le 帧。
+如果连接中途断开，会按官方协议用 `audio_id` + `received_seq` 续传（最多重试两次），
+所以长回复不会因为一次掉线就少一截；确实拿不回来时，只保留已收到的音频，
+字幕也只覆盖有声音的部分（不会把整段文字压进剩下的时长）。
+
+**格式**：下拉框可选 **MP3**（内置 `lamejs`，128 kbps）或 **WAV**（24 kHz / 16 bit 无损）。
+浏览器扩展运行在沙箱里，无法调用系统安装的 `ffmpeg`，所以这里直接内置了 MP3 编码器，
+不需要任何外部程序。
+
+**长对话**：导出在页面的 content-script 里执行，不在弹窗里：
+
+- 弹窗可以关掉，任务会继续跑，文件自己保存；
+- 进度显示「正在合成 N/M…」，旁边有「取消」按钮（已合成的部分仍会保存）；
+- MP3 按条即时编码，内存占用不随对话长度增长；
+- 消息列表取全部（最多最近 400 条），不再是 20 条；
+- 遇到额度用尽（错误码 4）会停下，已合成的部分照常保存。
+
+**不分段** 时，所有消息的音频按顺序拼成**一个**文件（导出时就已合成好，不需要事后再合并）。
+
+**分段导出**：下拉框可选「不分段 / 每 5 / 10 / 20 分钟」。分段按目标时长在**采样级别**切分，
+所以即使是单条超长回复（例如一次 32 分钟的朗读）也会切成多段；每段单独生成
+`…-part01.mp3`、`…-part02.mp3`，勾选字幕时每段也各自带一个 `.srt`
+（时间轴从该段开头重新计时，文本按时间比例分配到各段）。
+第一段之外的下载可能需要浏览器允许「下载多个文件」。
+
+**两种音色**：区块里有两个音色下拉框——「DeepSeek」和「你」。
+单条下载会按消息角色自动选对应音色；勾选「整个对话」则把所有消息依次合成（首尾相接）。
+切换音色用 `POST /api/v0/chat/tts/voice`，结束后会把账号原来的音色恢复；
+如果导出途中页面被关掉，下次加载页面也会恢复。整个对话会消耗较多朗读额度。
+
+### 视频与字幕
+
+勾选 **「同时导出 SRT 字幕（可做视频）」** 后，音频旁边会多一个 `.srt` 文件：
+时间轴按每条消息实际合成的时长计算，长句会切成适合单屏阅读的短行。
+导出完成后按钮区会出现 **「ffmpeg 命令」**：点击即可把现成命令复制到剪贴板
+（多段时是合并成一条 MP3 的命令，单段带字幕时是合成视频的命令），
+在下载目录打开终端粘贴执行即可。扩展本身不能启动 ffmpeg（浏览器沙箱限制），
+所以这里只提供命令，视频由本机 ffmpeg 完成。手动写的话，Windows 示例：
+
+```bat
+ffmpeg -f lavfi -i color=c=0x111111:s=1280x720:r=30 ^
+       -i deepseek-dialog-20261102-171333.mp3 ^
+       -vf "subtitles=deepseek-dialog-20261102-171333.srt:force_style='FontName=DejaVu Sans,FontSize=28'" ^
+       -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest out.mp4
+```
+
+**关于第三方网站**（online-video-cutter 之类）：插件**不会**把对话正文发出去，
+既不会自动上传，也不会因为「两边都用同一个 Gmail 登录」就发。
+同一个 Google 账号登录不等于同一个信任边界——那是另一家公司、另一套数据条款，
+和 DeepSeek 的对话数据没有关系。所以插件只做本地导出（音频 + `.srt`），
+要不要再上传到别处由你自己决定。
+
+> 更新插件后记得**刷新一次 DeepSeek 标签页**：已打开的页面里仍然跑着旧的 content script，
+> 弹窗会显示「需要刷新页面」并给出刷新按钮（`bridge.js` 通过 `bridgeVersion` 自检版本）。
+
+权限仍然只有一个：`https://chat.deepseek.com/*`。不收集数据、不向第三方发送任何东西；
+「试听」会直接用 `<audio>` 播放官方 CDN 上的公开样例（`cdn.deepseek.com`，不需要 token）。
 
 ## 四、卸载 / 还原
 
@@ -146,6 +225,10 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 - 音色语言表不同：贝壳/白浪支持 29 种语言，海星/暗潮只支持中英日韩等 10 种；
   撞语言不支持时会提示「当前语言暂不支持朗读，可尝试切换音色」。
 - `ticket` 是一次性的、600 秒有效；官方前端每轮连接都重新取票，插件不碰这部分。
+- 「下载音频」和官方朗读走同一个 TTS 接口，同样消耗朗读额度、受频率限制；
+  额度用完 / 频率过高 / 音色不支持该语言时，弹窗里会直接给出对应提示。
+- 「整个对话」是逐条请求：N 条消息会合成 N 次，耗时和额度消耗都按条累加；
+  单条超长回答受服务端 TTS 单次时长限制，必要时会在结果里显示为跳过。
 - 这是灰测功能的接口，官方随时可能改协议或加服务端校验；届时插件可能需要更新。
 
 ## 六、音色对照（实测）
@@ -165,7 +248,8 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 - 本项目只修改**浏览器本地**的功能开关，通过官方接口、用**你本人账号**的凭据请求；不绕过鉴权、不抓取他人数据、不代理他人流量。
 - 「朗读」是官方灰度中的功能，接口和前端随时可能变更，本项目**不保证长期有效**，也不保证不被官方判定为非常规使用。
-- 插件会把你的 `userToken` 留在页面上下文里用于调用官方接口（本来就在那儿），除此之外**不向外发送任何数据**。担心的话请自行审代码（一共 5 个文件、不到 200 行）。
+- 插件会把你的 `userToken` 留在页面上下文里用于调用官方接口（本来就在那儿），除此之外**不向外发送任何数据**。担心的话请自行审代码（自有代码 7 个源文件、约 1900 行；试听会直接请求官方 CDN 的公开样例）。
+- 内置的 MP3 编码器 `lamejs.min.js` 是第三方 LGPL-3.0 库（lamejs 1.2.1，未修改，可独立替换），完整许可证见 `LICENSE-lamejs.txt`。
 - 使用产生的一切后果由使用者自行承担。若官方发布正式版或明确禁止，请停用本项目。
 
 ## 八、相关

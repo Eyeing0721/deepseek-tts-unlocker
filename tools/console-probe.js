@@ -134,6 +134,18 @@ function dsToken() {
   try { return JSON.parse(localStorage.getItem('userToken') || 'null')?.value || null; } catch { return null; }
 }
 
+// 当前接口把正文放在 fragments[].content；老数据可能还有 message.content
+function dsMsgText(m) {
+  if (!m) return '';
+  if (Array.isArray(m.fragments)) {
+    const parts = m.fragments.filter(f => f && typeof f.content === 'string' && f.content);
+    const visible = parts.filter(f => !/^think/i.test(String(f.type || '')));
+    const text = (visible.length ? visible : parts).map(f => f.content).join('\n').trim();
+    if (text) return text;
+  }
+  return typeof m.content === 'string' ? m.content : '';
+}
+
 /* ---------------------------------------------------------------------------
  * E. 完整朗读播放器：绕开 UI，直接走 wss 把某条回答读出来
  *    dsTtsRead() 默认读当前会话最后一条有正文的消息；也可 dsTtsRead({messageId})
@@ -153,9 +165,9 @@ async function dsTtsRead(opts = {}) {
 
   let messageId = opts.messageId;
   if (!messageId) {
-    const h = await api('/api/v0/chat/history_messages?chat_session_id=' + sessionId);
+    const h = await api('/api/v0/chat/history_messages?chat_session_id=' + sessionId + '&cache_version=0');
     const msgs = h?.data?.biz_data?.chat_messages || [];
-    const last = msgs.filter(m => m && m.content).pop();
+    const last = msgs.filter(m => m && dsMsgText(m)).pop();
     if (!last) throw new Error('这个会话里没找到可朗读的消息');
     messageId = last.message_id;
   }

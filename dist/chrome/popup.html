@@ -1,49 +1,110 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <style>
   :root { color-scheme: light dark; }
-  body { margin: 0; width: 320px; font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; padding: 12px 14px 14px; }
+  body { margin: 0; width: 340px; font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; padding: 12px 14px 14px; }
   h1 { font-size: 14px; margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: #c9c9c9; display: inline-block; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #c9c9c9; display: inline-block; flex: 0 0 auto; }
   .dot.on { background: #22c55e; }
   .dot.off { background: #ef4444; }
   .row { margin: 6px 0; }
   .muted { opacity: .65; }
+  .small { font-size: 12px; }
   code { background: rgba(127,127,127,.18); padding: 0 4px; border-radius: 3px; }
-  select, button { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(127,127,127,.45); background: transparent; color: inherit; }
-  button { cursor: pointer; }
+  select, button { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(127,127,127,.45); color: inherit; }
+  button { cursor: pointer; background: transparent; }
   button:disabled { opacity: .5; cursor: default; }
+  /* 不透明系统色：否则深色主题下下拉列表会是白底 */
+  select { max-width: 100%; background-color: Canvas; color: CanvasText; }
+  select option { background-color: Canvas; color: CanvasText; }
+  .langs { display: flex; gap: 8px; }
+  .langs label { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .langs select { width: 100%; min-width: 0; }
+  #voice, #message { width: 100%; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  #audioFormat { flex: 0 0 auto; }
+  .check { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .check input { margin: 0; }
+  .checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .split { display: flex; align-items: center; gap: 8px; }
+  .split select { flex: 1 1 auto; min-width: 0; }
   #models { margin: 4px 0 0; padding-left: 16px; }
   #models li { margin: 1px 0; }
+  details > summary { cursor: pointer; opacity: .65; }
+  details > summary:hover { opacity: 1; }
+  details[open] > summary { margin-bottom: 4px; }
   .ok { color: #22c55e; } .bad { color: #ef4444; }
-  hr { border: 0; border-top: 1px solid rgba(127,127,127,.25); margin: 10px 0; }
+  hr { border: 0; border-top: 1px solid rgba(127,127,127,.25); margin: 8px 0; }
 </style>
 </head>
 <body>
-  <h1><span id="dot" class="dot"></span>DeepSeek 朗读解锁</h1>
+  <h1><span id="dot" class="dot"></span><span data-i18n="appName"></span></h1>
 
-  <div class="row" id="page">检测页面…</div>
+  <div class="row langs">
+    <label><span class="muted" data-i18n="uiLang"></span><select id="uiLang"></select></label>
+    <label><span class="muted" data-i18n="voiceLang"></span><select id="voiceLang"></select></label>
+  </div>
+  <div class="row small muted" data-i18n="voiceLangHint"></div>
+
+  <div class="row" id="page"></div>
+  <div class="row small muted" id="build"></div>
   <div class="row" id="gray"></div>
-  <div class="row"><button id="grant" hidden>授权访问 chat.deepseek.com</button></div>
+  <div class="row"><button id="grant" hidden data-i18n="grant"></button></div>
 
   <hr>
 
-  <div class="row">
-    <label class="muted" for="voice">朗读音色</label><br>
-    <select id="voice" disabled><option>加载中…</option></select>
-    <button id="save" disabled>保存</button>
+  <div class="row muted" data-i18n="voiceHeading"></div>
+  <div class="row"><select id="voice" disabled></select></div>
+  <div class="row btnrow">
+    <button id="preview" disabled data-i18n="preview"></button>
+    <button id="save" disabled data-i18n="save"></button>
   </div>
-  <div class="row muted" id="msg"></div>
+  <div class="row small muted" id="voiceInfo"></div>
+  <div class="row small" id="msg"></div>
+
+  <hr>
+  <details id="audioBox">
+    <summary class="muted" data-i18n="audioHeading"></summary>
+    <div class="row"><select id="message" disabled></select></div>
+    <div class="row langs">
+      <label><span class="small muted" data-i18n="roleAssistant"></span><select id="assistantVoice" disabled></select></label>
+      <label><span class="small muted" data-i18n="roleUser"></span><select id="userVoice" disabled></select></label>
+    </div>
+    <div class="row checks">
+      <label class="check"><input type="checkbox" id="wholeDialog"> <span class="small muted" data-i18n="wholeDialog"></span></label>
+      <label class="check"><input type="checkbox" id="srt"> <span class="small muted" data-i18n="srt"></span></label>
+    </div>
+    <div class="row split">
+      <span class="small muted" data-i18n="splitLabel"></span>
+      <select id="split">
+        <option value="0" data-i18n="splitNone"></option>
+        <option value="5" data-i18n="split5"></option>
+        <option value="10" data-i18n="split10"></option>
+        <option value="20" data-i18n="split20"></option>
+      </select>
+    </div>
+    <div class="row btnrow">
+      <select id="audioFormat">
+        <option value="mp3">MP3</option>
+        <option value="wav">WAV</option>
+      </select>
+      <button id="download" disabled></button>
+      <button id="ffmpegCmd" hidden data-i18n="ffmpegCmd"></button>
+      <button id="cancelExport" hidden data-i18n="cancel"></button>
+      <button id="reloadPage" hidden data-i18n="reloadPage"></button>
+    </div>
+    <div class="row small muted" id="audioInfo"></div>
+    <div class="row small" id="audioMsg"></div>
+  </details>
 
   <hr>
   <div class="row">
-    <button id="reset">清掉本地缓存并刷新（还原）</button>
+    <button id="reset" data-i18n="reset"></button>
   </div>
-  <div class="row muted">
-    装好插件后<strong>刷新一次</strong> DeepSeek 页面，每条回答下方就会出现「朗读」按钮，用的是官方播放器。
-  </div>
+  <div class="row muted" data-i18n-html="footer"></div>
+  <script src="i18n.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

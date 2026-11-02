@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "DeepSeek 朗读解锁",
-  "version": "1.1.0",
-  "description": "让没有灰度到「朗读 / TTS」的 DeepSeek 网页版账号也能用官方朗读功能。纯本地生效，不改动账号数据。",
+  "default_locale": "en",
+  "name": "__MSG_appName__",
+  "version": "1.8.2",
+  "description": "__MSG_appDesc__",
   "host_permissions": ["https://chat.deepseek.com/*"],
   "optional_host_permissions": ["*://chat.deepseek.com/*"],
   "content_scripts": [
@@ -15,14 +16,14 @@
     },
     {
       "matches": ["https://chat.deepseek.com/*"],
-      "js": ["bridge.js"],
+      "js": ["lamejs.min.js", "bridge.js"],
       "run_at": "document_start",
       "all_frames": false
     }
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "DeepSeek 朗读解锁"
+    "default_title": "__MSG_appName__"
   },
   "browser_specific_settings": {
     "gecko": {
