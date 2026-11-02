@@ -151,16 +151,28 @@ function synthesizePcm(sessionId, messageId, ticket) {
     const frames = new Map();
     let realFormat = 'pcm';
     let settled = false;
+    let sawFinish = false;
+    let lastActivity = Date.now();
+    const startedAt = Date.now();
+    const HARD_MS = 300000;
     const finish = (fn, arg) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearInterval(watchdog);
       try { ws.close(); } catch { /* 忽略 */ }
       fn(arg);
     };
-    const timer = setTimeout(() => finish(reject, new Error('timeout')), 180000);
+    // 长时间没数据就收尾：已经收到的帧照样返回（incomplete），别把整段导出拖死
+    const watchdog = setInterval(() => {
+      const now = Date.now();
+      const idleLimit = frames.size ? 30000 : 90000;
+      if (now - startedAt > HARD_MS || now - lastActivity > idleLimit) {
+        finish(resolve, { frames, realFormat, incomplete: true });
+      }
+    }, 1000);
 
     ws.onmessage = (ev) => {
+      lastActivity = Date.now();
       if (typeof ev.data === 'string') {
         let m;
         try { m = JSON.parse(ev.data); } catch { return; }
@@ -168,6 +180,7 @@ function synthesizePcm(sessionId, messageId, ticket) {
           realFormat = m.format || realFormat;
           ack(ws, 0);
         } else if (m.event === 'finish') {
+          sawFinish = true;
           if (typeof m.code === 'number' && m.code !== 0) finish(reject, new TtsError(m.code, m.msg));
           else finish(resolve, { frames, realFormat });
         } else if (m.event === 'error') {
@@ -181,11 +194,12 @@ function synthesizePcm(sessionId, messageId, ticket) {
       ack(ws, seq);
     };
     ws.onerror = () => finish(reject, new Error('websocket error'));
-    ws.onclose = () => finish(resolve, { frames, realFormat });
+    ws.onclose = () => finish(resolve, { frames, realFormat, incomplete: !sawFinish && frames.size > 0 });
   });
 }
 
-function wavHeader(dataSize) {  const channels = 1;
+function wavHeader(dataSize) {
+  const channels = 1;
   const bitsPerSample = 16;
   const blockAlign = channels * bitsPerSample / 8;
   const out = new Uint8Array(44);
@@ -334,8 +348,11 @@ function jobSnapshot(job) {
     skipped: job.skipped.length,
     seconds: Number(job.seconds.toFixed(1)),
     bytes: job.bytes,
+    truncated: job.truncated,
     filename: job.filename,
     srtName: job.srtName,
+    files: job.files,
+    srtCount: job.srtNames ? job.srtNames.length : 0,
     error: job.error,
     code: job.code,
     cancelled: job.cancelled,
@@ -348,11 +365,7 @@ async function runExport(job) {
 
   let baseVoice = null;
   let changed = false;
-  const pcmParts = [];
-  const mp3Parts = [];
-  const segments = [];
-  let pcmBytes = 0;
-  let elapsed = 0;
+  const encoded = [];
 
   try {
     try { baseVoice = await readCurrentVoice(tk); } catch { baseVoice = null; }
@@ -360,33 +373,53 @@ async function runExport(job) {
 
     for (const item of job.items) {
       if (job.cancel) { job.cancelled = true; break; }
-      try {
-        const want = item.voiceId || baseVoice;
-        if (want && want !== knownVoice) {
-          if (!changed && baseVoice && !savedVoice()) savePendingVoice(baseVoice);
-          await applyVoice(tk, want);
-          changed = true;
+
+      let result = null;
+      let failure = null;
+      for (let attempt = 0; attempt < 2 && !result; attempt++) {
+        try {
+          const want = item.voiceId || baseVoice;
+          if (want && want !== knownVoice) {
+            if (!changed && baseVoice && !savedVoice()) savePendingVoice(baseVoice);
+            await applyVoice(tk, want);
+            changed = true;
+          }
+          result = await downloadPcm(job.sessionId, item.id, tk);
+        } catch (e) {
+          const code = e && typeof e.code === 'number' ? e.code : null;
+          const message = String((e && e.message) || e);
+          failure = { code, error: message };
+          // 网络抖动 / 服务端没给音频：重试一次；额度类错误不重试
+          const transient = !code && /no audio|websocket error|timeout/i.test(message);
+          if (!transient) break;
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 800));
         }
-        const { pcm, seconds } = await downloadPcm(job.sessionId, item.id, tk);
-        job.seconds += seconds;
-        if (job.format === 'mp3') mp3Parts.push(...encodeMp3Parts(pcm));
-        else { pcmParts.push(pcm); pcmBytes += pcm.length; }
-        if (textMap) {
-          const text = textMap.get(item.id);
-          if (text) segments.push({ text, start: elapsed, duration: seconds });
+      }
+
+      if (result) {
+        job.seconds += result.seconds;
+        if (result.incomplete) job.truncated += 1;
+        try {
+          const piece = { seconds: result.seconds, text: textMap ? (textMap.get(item.id) || '') : '' };
+          if (job.format === 'mp3') piece.mp3 = encodeMp3Parts(result.pcm);
+          else piece.pcm = result.pcm;
+          encoded.push(piece);
+        } catch (e) {
+          failure = { code: null, error: String((e && e.message) || e) };
+          result = null;
         }
-        elapsed += seconds;
-      } catch (e) {
-        const code = e && typeof e.code === 'number' ? e.code : null;
-        job.skipped.push({ id: item.id, code, error: String((e && e.message) || e) });
+      }
+
+      if (!result) {
+        const code = failure ? failure.code : null;
+        job.skipped.push({ id: item.id, code, error: failure ? failure.error : 'unknown' });
         // 额度用尽 / 无权限 / 服务不可用：后面的消息也不会成功，提前收尾
         if (code === 4 || code === 9 || code === 11) { job.code = code; break; }
-      } finally {
-        job.done += 1;
       }
+      job.done += 1;
     }
 
-    if (!mp3Parts.length && !pcmParts.length) {
+    if (!encoded.length) {
       const first = job.skipped[0];
       job.status = 'error';
       job.code = first ? first.code : null;
@@ -394,26 +427,60 @@ async function runExport(job) {
       return;
     }
 
-    let blob;
-    let ext;
-    if (job.format === 'mp3') {
-      blob = new Blob(mp3Parts, { type: 'audio/mpeg' });
-      ext = 'mp3';
+    // 按目标时长切块：每块的音频与字幕各自独立，文件名带 -partNN
+    const limit = job.split > 0 ? job.split * 60 : 0;
+    const groups = [];
+    if (!limit) {
+      groups.push(encoded);
     } else {
-      blob = new Blob([wavHeader(pcmBytes), ...pcmParts], { type: 'audio/wav' });
-      ext = 'wav';
+      let cur = [];
+      let curSeconds = 0;
+      for (const piece of encoded) {
+        if (cur.length && curSeconds + piece.seconds > limit) { groups.push(cur); cur = []; curSeconds = 0; }
+        cur.push(piece);
+        curSeconds += piece.seconds;
+      }
+      if (cur.length) groups.push(cur);
     }
 
     const base = `${job.prefix}-${stampName()}`;
-    job.filename = `${base}.${ext}`;
-    job.bytes = blob.size;
-    triggerDownload(blob, job.filename);
+    const ext = job.format === 'mp3' ? 'mp3' : 'wav';
+    job.files = groups.length;
+    job.filenames = [];
 
-    if (textMap && segments.length) {
-      const srt = buildSrt(segments);
-      if (srt) {
-        job.srtName = `${base}.srt`;
-        triggerDownload(new Blob([srt], { type: 'application/x-subrip' }), job.srtName);
+    for (let g = 0; g < groups.length; g++) {
+      const group = groups[g];
+      const suffix = groups.length > 1 ? `-part${String(g + 1).padStart(2, '0')}` : '';
+      const name = `${base}${suffix}.${ext}`;
+
+      let blob;
+      if (job.format === 'mp3') {
+        blob = new Blob(group.flatMap((p) => p.mp3), { type: 'audio/mpeg' });
+      } else {
+        let size = 0;
+        for (const p of group) size += p.pcm.length;
+        blob = new Blob([wavHeader(size), ...group.map((p) => p.pcm)], { type: 'audio/wav' });
+      }
+
+      job.bytes += blob.size;
+      job.filenames.push(name);
+      if (!job.filename) job.filename = name;
+      triggerDownload(blob, name);
+
+      if (job.srt) {
+        const segments = [];
+        let offset = 0;
+        for (const p of group) {
+          if (p.text) segments.push({ text: p.text, start: offset, duration: p.seconds });
+          offset += p.seconds;
+        }
+        const srt = buildSrt(segments);
+        if (srt) {
+          const srtName = `${base}${suffix}.srt`;
+          job.srtNames.push(srtName);
+          if (!job.srtName) job.srtName = srtName;
+          triggerDownload(new Blob([srt], { type: 'application/x-subrip' }), srtName);
+        }
       }
     }
 
@@ -499,7 +566,7 @@ async function downloadPcm(sessionId, messageId, tk) {
     throw new Error('ticket: ' + JSON.stringify(ticketRes).slice(0, 200));
   }
 
-  const { frames, realFormat } = await synthesizePcm(sessionId, messageId, ticketRes.data.biz_data.ticket);
+  const { frames, realFormat, incomplete } = await synthesizePcm(sessionId, messageId, ticketRes.data.biz_data.ticket);
   if (realFormat !== 'pcm') throw new Error('unsupported format: ' + realFormat);
 
   const seqs = [...frames.keys()].sort((a, b) => a - b);
@@ -514,7 +581,7 @@ async function downloadPcm(sessionId, messageId, tk) {
     pcm.set(chunk, offset);
     offset += chunk.length;
   }
-  return { pcm, seconds: total / 2 / SAMPLE_RATE };
+  return { pcm, seconds: total / 2 / SAMPLE_RATE, incomplete: !!incomplete };
 }
 
 // 跨浏览器：Firefox 用 browser.*（Promise），Chrome/Edge 用 chrome.*
@@ -619,11 +686,16 @@ ext.runtime.onMessage.addListener((msg, _sender, reply) => {
           items,
           format: msg.format === 'wav' ? 'wav' : 'mp3',
           prefix: msg.prefix === 'dialog' ? 'deepseek-dialog' : 'deepseek-tts',
+          split: Number(msg.split) > 0 ? Number(msg.split) : 0,
           srt: !!msg.srt,
           srtName: null,
+          srtNames: [],
+          files: 0,
+          filenames: [],
           status: 'running',
           done: 0,
           seconds: 0,
+          truncated: 0,
           skipped: [],
           bytes: 0,
           filename: null,

@@ -27,6 +27,9 @@
   #audioFormat { flex: 0 0 auto; }
   .check { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .check input { margin: 0; }
+  .checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .split { display: flex; align-items: center; gap: 8px; }
+  .split select { flex: 1 1 auto; min-width: 0; }
   #models { margin: 4px 0 0; padding-left: 16px; }
   #models li { margin: 1px 0; }
   details > summary { cursor: pointer; opacity: .65; }
@@ -46,6 +49,7 @@
   <div class="row small muted" data-i18n="voiceLangHint"></div>
 
   <div class="row" id="page"></div>
+  <div class="row small muted" id="build"></div>
   <div class="row" id="gray"></div>
   <div class="row"><button id="grant" hidden data-i18n="grant"></button></div>
 
@@ -68,11 +72,18 @@
       <label><span class="small muted" data-i18n="roleAssistant"></span><select id="assistantVoice" disabled></select></label>
       <label><span class="small muted" data-i18n="roleUser"></span><select id="userVoice" disabled></select></label>
     </div>
-    <div class="row">
+    <div class="row checks">
       <label class="check"><input type="checkbox" id="wholeDialog"> <span class="small muted" data-i18n="wholeDialog"></span></label>
-    </div>
-    <div class="row">
       <label class="check"><input type="checkbox" id="srt"> <span class="small muted" data-i18n="srt"></span></label>
+    </div>
+    <div class="row split">
+      <span class="small muted" data-i18n="splitLabel"></span>
+      <select id="split">
+        <option value="0" data-i18n="splitNone"></option>
+        <option value="5" data-i18n="split5"></option>
+        <option value="10" data-i18n="split10"></option>
+        <option value="20" data-i18n="split20"></option>
+      </select>
     </div>
     <div class="row btnrow">
       <select id="audioFormat">

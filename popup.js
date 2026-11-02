@@ -40,6 +40,7 @@ const state = {
   audioFormat: 'mp3',
   wholeDialog: false,
   subs: false,
+  split: 0,
   saving: false,
   granting: false,
   audio: null,
@@ -184,6 +185,8 @@ function loadSettings() {
     if (saved.audioFormat === 'wav' || saved.audioFormat === 'mp3') state.audioFormat = saved.audioFormat;
     state.wholeDialog = !!saved.wholeDialog;
     state.subs = !!saved.subs;
+    const split = Number(saved.split);
+    if ([0, 5, 10, 20].includes(split)) state.split = split;
   } catch { /* 设置损坏就回到默认 */ }
 }
 
@@ -197,6 +200,7 @@ function persistSettings() {
       audioFormat: state.audioFormat,
       wholeDialog: state.wholeDialog,
       subs: state.subs,
+      split: state.split,
     }));
   } catch { /* 存不了就只在本窗口生效 */ }
 }
@@ -245,8 +249,17 @@ function renderStatus() {
   const page = $('page');
   const gray = $('gray');
   const grant = $('grant');
+  const build = $('build');
   grant.hidden = true;
   gray.textContent = '';
+
+  const extVersion = (() => {
+    try { return api.runtime.getManifest().version; } catch { return '?'; }
+  })();
+  const bridgeVersion = state.st && typeof state.st.bridgeVersion === 'number' ? state.st.bridgeVersion : null;
+  build.textContent = bridgeVersion != null
+    ? `v${extVersion} · bridge v${bridgeVersion}`
+    : `v${extVersion}`;
 
   if (state.mode === 'checking') {
     dot.className = 'dot';
@@ -387,6 +400,7 @@ function renderAudioSection() {
   const format = $('audioFormat');
   const whole = $('wholeDialog');
   const srt = $('srt');
+  const split = $('split');
   const list = state.messages || [];
   const voices = state.voices && Array.isArray(state.voices.voices) ? state.voices.voices : [];
 
@@ -398,6 +412,8 @@ function renderAudioSection() {
   whole.disabled = state.downloading || !list.length;
   srt.checked = state.subs;
   srt.disabled = state.downloading;
+  split.value = String(state.split);
+  split.disabled = state.downloading;
   cancel.hidden = !state.downloading;
   fillVoiceSelect($('assistantVoice'), state.assistantVoice, voices);
   fillVoiceSelect($('userVoice'), state.userVoice, voices);
@@ -663,15 +679,22 @@ async function pollExport(jobId) {
   if (job.status === 'done') {
     const sec = Number(job.seconds).toFixed(1);
     const size = formatSize(job.bytes);
-    const srtSuffix = job.srtName ? esc(t('srtSaved', { name: job.srtName })) : '';
-    if (job.cancelled) setAudioMsg('exportCancelled', { sec, size, done: job.done, total: job.total }, 'muted', srtSuffix);
-    else if (job.skipped) setAudioMsg('dialogDoneSkipped', { sec, size, n: job.skipped }, 'ok', srtSuffix);
-    else setAudioMsg('downloadDone', { sec, size }, 'ok', srtSuffix);
+    const extras = [];
+    if (job.files > 1) extras.push(esc(t('partsSaved', { n: job.files })));
+    if (job.srtCount > 1) extras.push(esc(t('srtCountSaved', { n: job.srtCount })));
+    else if (job.srtName) extras.push(esc(t('srtSaved', { name: job.srtName })));
+    if (job.truncated) extras.push(esc(t('truncated', { n: job.truncated })));
+    const extra = extras.join(' · ');
+    if (job.cancelled) setAudioMsg('exportCancelled', { sec, size, done: job.done, total: job.total }, 'muted', extra);
+    else if (job.skipped) setAudioMsg('dialogDoneSkipped', { sec, size, n: job.skipped }, 'ok', extra);
+    else setAudioMsg('downloadDone', { sec, size }, 'ok', extra);
   } else {
     const key = ttsErrorKey(job.code);
     if (key) setAudioMsg(key, null, 'bad');
     else if (job.error === 'mp3-encoder-missing') setAudioMsg('bridgeOutdated', null, 'bad');
     else if (job.error === 'cancelled') setAudioMsg('exportCancelled', { sec: '0', size: formatSize(0), done: job.done, total: job.total }, 'muted');
+    else if (/timeout/i.test(job.error || '')) setAudioMsg('ttsTimeout', null, 'bad');
+    else if (/no audio/i.test(job.error || '')) setAudioMsg('ttsNoAudio', null, 'bad');
     else setAudioMsg('downloadFailed', { err: shortJson(job.error || 'unknown') }, 'bad');
   }
 
@@ -708,6 +731,7 @@ async function downloadAudio() {
     items,
     format: state.audioFormat,
     prefix: state.wholeDialog ? 'dialog' : 'single',
+    split: state.split,
     srt: state.subs,
   });
 
@@ -784,6 +808,13 @@ function bind() {
 
   $('srt').addEventListener('change', () => {
     state.subs = $('srt').checked;
+    persistSettings();
+    renderAudioSection();
+  });
+
+  $('split').addEventListener('change', () => {
+    const value = Number($('split').value);
+    state.split = [0, 5, 10, 20].includes(value) ? value : 0;
     persistSettings();
     renderAudioSection();
   });
