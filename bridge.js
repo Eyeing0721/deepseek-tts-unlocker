@@ -6,7 +6,7 @@
 
 const KEY = '__ds_remote_feature_store_model';
 const SAMPLE_RATE = 24000;
-const BRIDGE_VERSION = 7;
+const BRIDGE_VERSION = 8;
 
 function token() {
   try { return JSON.parse(localStorage.getItem('userToken') || 'null')?.value || null; } catch { return null; }
@@ -135,23 +135,35 @@ class TtsError extends Error {
   }
 }
 
-// 官方朗读用的是同一条 wss；这里按 seq 收集二进制帧，攒成完整 PCM
-function synthesizePcm(sessionId, messageId, ticket) {
-  return new Promise((resolve, reject) => {
-    const qs = new URLSearchParams({
+// 官方朗读用的是同一条 wss；断流时按协议用 audio_id + received_seq 续传
+const RESUME_ATTEMPTS = 2;
+
+function synthesizePcm(sessionId, messageId, issueTicket) {
+  const frames = new Map();
+  let realFormat = 'pcm';
+  let audioId = null;
+  let lastSeq = -1;
+  let resumes = 0;
+
+  const attempt = (ticket, resume) => new Promise((resolve, reject) => {
+    const params = {
       chat_session_id: sessionId,
       message_id: String(messageId),
       ticket,
       mode: 'manual',
       format: 'pcm',
-    });
+    };
+    if (resume && audioId) {
+      params.audio_id = audioId;
+      params.received_seq = String(Math.max(0, lastSeq));
+      params.played_seq = String(Math.max(0, lastSeq));
+    }
+    const qs = new URLSearchParams(params);
     const ws = new WebSocket(`wss://${location.host}/api/v0/chat/tts/?${qs}`);
     ws.binaryType = 'arraybuffer';
 
-    const frames = new Map();
-    let realFormat = 'pcm';
     let settled = false;
-    let sawFinish = false;
+    let gotAny = false;
     let lastActivity = Date.now();
     const startedAt = Date.now();
     const HARD_MS = 300000;
@@ -162,12 +174,12 @@ function synthesizePcm(sessionId, messageId, ticket) {
       try { ws.close(); } catch { /* 忽略 */ }
       fn(arg);
     };
-    // 长时间没数据就收尾：已经收到的帧照样返回（incomplete），别把整段导出拖死
+    // 长时间没数据就收尾，交给外层决定是否续传
     const watchdog = setInterval(() => {
       const now = Date.now();
       const idleLimit = frames.size ? 30000 : 90000;
       if (now - startedAt > HARD_MS || now - lastActivity > idleLimit) {
-        finish(resolve, { frames, realFormat, incomplete: true });
+        finish(resolve, { done: false, gotAny });
       }
     }, 1000);
 
@@ -178,11 +190,11 @@ function synthesizePcm(sessionId, messageId, ticket) {
         try { m = JSON.parse(ev.data); } catch { return; }
         if (m.event === 'ready') {
           realFormat = m.format || realFormat;
+          if (m.audio_id) audioId = m.audio_id;
           ack(ws, 0);
         } else if (m.event === 'finish') {
-          sawFinish = true;
           if (typeof m.code === 'number' && m.code !== 0) finish(reject, new TtsError(m.code, m.msg));
-          else finish(resolve, { frames, realFormat });
+          else finish(resolve, { done: true, gotAny });
         } else if (m.event === 'error') {
           finish(reject, new TtsError(m.code, m.msg || m.message));
         }
@@ -191,11 +203,26 @@ function synthesizePcm(sessionId, messageId, ticket) {
       const view = new DataView(ev.data);
       const seq = view.getUint32(0, false);
       frames.set(seq, new Uint8Array(ev.data, 4));
+      lastSeq = Math.max(lastSeq, seq);
+      gotAny = true;
       ack(ws, seq);
     };
-    ws.onerror = () => finish(reject, new Error('websocket error'));
-    ws.onclose = () => finish(resolve, { frames, realFormat, incomplete: !sawFinish && frames.size > 0 });
+    ws.onerror = () => finish(resolve, { done: false, gotAny });
+    ws.onclose = () => finish(resolve, { done: false, gotAny });
   });
+
+  return (async () => {
+    while (true) {
+      const ticket = await issueTicket();
+      const r = await attempt(ticket, resumes > 0);
+      if (r.done) return { frames, realFormat, incomplete: false };
+      if (!frames.size) return { frames, realFormat, incomplete: true };
+      if (!r.gotAny && resumes > 0) return { frames, realFormat, incomplete: true };
+      if (resumes >= RESUME_ATTEMPTS) return { frames, realFormat, incomplete: true };
+      resumes += 1;
+      await new Promise((done) => setTimeout(done, 600));
+    }
+  })();
 }
 
 function wavHeader(dataSize) {
@@ -457,7 +484,15 @@ async function runExport(job) {
         job.seconds += result.seconds;
         if (result.incomplete) job.truncated += 1;
         try {
-          addAudio(result.pcm, result.seconds, textMap ? (textMap.get(item.id) || '') : '');
+          addAudio(result.pcm, result.seconds, (() => {
+            let text = textMap ? (textMap.get(item.id) || '') : '';
+            // 音频被截断时不要把整段文字压进剩下的时间：按语速估算裁掉没有声音的部分
+            if (text && result.incomplete) {
+              const maxChars = Math.round(result.seconds * 14);
+              if (text.length > maxChars) text = text.slice(0, maxChars).replace(/\s+\S*$/, '');
+            }
+            return text;
+          })());
         } catch (e) {
           failure = { code: null, error: String((e && e.message) || e) };
           result = null;
@@ -592,12 +627,15 @@ setTimeout(() => {
 }, 1500);
 
 async function downloadPcm(sessionId, messageId, tk) {
-  const ticketRes = await api('/api/v0/auth/ticket', { method: 'POST', body: JSON.stringify({ scope: 'tts' }) }, tk);
-  if (!ticketRes || ticketRes.code !== 0 || !ticketRes.data || ticketRes.data.biz_code !== 0) {
-    throw new Error('ticket: ' + JSON.stringify(ticketRes).slice(0, 200));
-  }
+  const issueTicket = async () => {
+    const ticketRes = await api('/api/v0/auth/ticket', { method: 'POST', body: JSON.stringify({ scope: 'tts' }) }, tk);
+    if (!ticketRes || ticketRes.code !== 0 || !ticketRes.data || ticketRes.data.biz_code !== 0) {
+      throw new Error('ticket: ' + JSON.stringify(ticketRes).slice(0, 200));
+    }
+    return ticketRes.data.biz_data.ticket;
+  };
 
-  const { frames, realFormat, incomplete } = await synthesizePcm(sessionId, messageId, ticketRes.data.biz_data.ticket);
+  const { frames, realFormat, incomplete } = await synthesizePcm(sessionId, messageId, issueTicket);
   if (realFormat !== 'pcm') throw new Error('unsupported format: ' + realFormat);
 
   const seqs = [...frames.keys()].sort((a, b) => a - b);

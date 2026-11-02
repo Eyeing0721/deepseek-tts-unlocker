@@ -909,7 +909,7 @@ function bind() {
 
   state.mode = 'ready';
   state.st = st;
-  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 7);
+  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 8);
 
   const voicesRes = await send(tab.id, { type: 'voices' });
   state.voicesTried = true;

@@ -153,6 +153,9 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 （`inject.js` 在主世界截获 `fetch` / XHR 的响应），所以只要页面上能看到对话，列表通常就能出来。
 合成走官方同款流程：`POST /api/v0/auth/ticket {scope:"tts"}` 取一次性票 →
 `wss://chat.deepseek.com/api/v0/chat/tts/?...&format=pcm` 收 24 kHz 单声道 s16le 帧。
+如果连接中途断开，会按官方协议用 `audio_id` + `received_seq` 续传（最多重试两次），
+所以长回复不会因为一次掉线就少一截；确实拿不回来时，只保留已收到的音频，
+字幕也只覆盖有声音的部分（不会把整段文字压进剩下的时长）。
 
 **格式**：下拉框可选 **MP3**（内置 `lamejs`，128 kbps）或 **WAV**（24 kHz / 16 bit 无损）。
 浏览器扩展运行在沙箱里，无法调用系统安装的 `ffmpeg`，所以这里直接内置了 MP3 编码器，
