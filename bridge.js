@@ -361,13 +361,68 @@ function jobSnapshot(job) {
   };
 }
 
+function textPortion(text, from, to, total) {
+  if (!text) return '';
+  const ratio = (v) => Math.max(0, Math.min(1, total > 0 ? v / total : 0));
+  let a = Math.round(text.length * ratio(from));
+  let b = Math.round(text.length * ratio(to));
+  if (a > 0) {
+    const sp = text.lastIndexOf(' ', a);
+    if (sp > 0 && a - sp < 40) a = sp + 1;
+  }
+  if (b < text.length) {
+    const sp = text.indexOf(' ', b);
+    if (sp !== -1 && sp - b < 40) b = sp;
+  }
+  return b > a ? text.slice(a, b).trim() : '';
+}
+
 async function runExport(job) {
   const tk = token();
   if (!tk) throw new Error('no-token');
 
   let baseVoice = null;
   let changed = false;
-  const encoded = [];
+
+  // 目标时长（秒），0 = 不分段；切分在采样级别进行，长单条消息也能切开
+  const limit = job.split > 0 ? job.split * 60 : 0;
+  const BYTES_PER_SEC = SAMPLE_RATE * 2;
+  const parts = [];
+  let part = null;
+
+  const newPart = () => {
+    part = { mp3: [], pcm: [], bytes: 0, seconds: 0, segments: [] };
+    parts.push(part);
+    return part;
+  };
+
+  // 把一段 PCM 放进当前部分；需要时在采样边界切开，长回复也能分段
+  const addAudio = (pcm, totalSeconds, text) => {
+    let offset = 0;
+    let pcmOffset = 0;
+    while (pcmOffset < pcm.length) {
+      if (!part) newPart();
+      if (limit && limit - part.seconds < 1) { part = null; continue; }
+      const remainSec = (pcm.length - pcmOffset) / BYTES_PER_SEC;
+      const room = limit ? limit - part.seconds : remainSec;
+      const sliceSec = Math.min(remainSec, room);
+      let sliceBytes = Math.round(sliceSec * BYTES_PER_SEC / 2) * 2;
+      sliceBytes = Math.max(2, Math.min(sliceBytes, pcm.length - pcmOffset));
+      const slice = pcm.subarray(pcmOffset, pcmOffset + sliceBytes);
+      const secs = slice.length / BYTES_PER_SEC;
+      if (job.format === 'mp3') part.mp3.push(...encodeMp3Parts(slice));
+      else part.pcm.push(slice);
+      part.bytes += slice.length;
+      if (text) {
+        const piece = textPortion(text, offset, offset + secs, totalSeconds || secs);
+        if (piece) part.segments.push({ text: piece, start: part.seconds, duration: secs });
+      }
+      part.seconds += secs;
+      offset += secs;
+      pcmOffset += slice.length;
+      if (limit && part.seconds >= limit - 0.05) part = null;
+    }
+  };
 
   try {
     try { baseVoice = await readCurrentVoice(tk); } catch { baseVoice = null; }
@@ -402,10 +457,7 @@ async function runExport(job) {
         job.seconds += result.seconds;
         if (result.incomplete) job.truncated += 1;
         try {
-          const piece = { seconds: result.seconds, text: textMap ? (textMap.get(item.id) || '') : '' };
-          if (job.format === 'mp3') piece.mp3 = encodeMp3Parts(result.pcm);
-          else piece.pcm = result.pcm;
-          encoded.push(piece);
+          addAudio(result.pcm, result.seconds, textMap ? (textMap.get(item.id) || '') : '');
         } catch (e) {
           failure = { code: null, error: String((e && e.message) || e) };
           result = null;
@@ -421,7 +473,8 @@ async function runExport(job) {
       job.done += 1;
     }
 
-    if (!encoded.length) {
+    const ready = parts.filter((p) => p.mp3.length || p.pcm.length);
+    if (!ready.length) {
       const first = job.skipped[0];
       job.status = 'error';
       job.code = first ? first.code : null;
@@ -429,39 +482,21 @@ async function runExport(job) {
       return;
     }
 
-    // 按目标时长切块：每块的音频与字幕各自独立，文件名带 -partNN
-    const limit = job.split > 0 ? job.split * 60 : 0;
-    const groups = [];
-    if (!limit) {
-      groups.push(encoded);
-    } else {
-      let cur = [];
-      let curSeconds = 0;
-      for (const piece of encoded) {
-        if (cur.length && curSeconds + piece.seconds > limit) { groups.push(cur); cur = []; curSeconds = 0; }
-        cur.push(piece);
-        curSeconds += piece.seconds;
-      }
-      if (cur.length) groups.push(cur);
-    }
-
     const base = `${job.prefix}-${stampName()}`;
     const ext = job.format === 'mp3' ? 'mp3' : 'wav';
-    job.files = groups.length;
+    job.files = ready.length;
     job.filenames = [];
 
-    for (let g = 0; g < groups.length; g++) {
-      const group = groups[g];
-      const suffix = groups.length > 1 ? `-part${String(g + 1).padStart(2, '0')}` : '';
+    for (let g = 0; g < ready.length; g++) {
+      const group = ready[g];
+      const suffix = ready.length > 1 ? `-part${String(g + 1).padStart(2, '0')}` : '';
       const name = `${base}${suffix}.${ext}`;
 
       let blob;
       if (job.format === 'mp3') {
-        blob = new Blob(group.flatMap((p) => p.mp3), { type: 'audio/mpeg' });
+        blob = new Blob(group.mp3, { type: 'audio/mpeg' });
       } else {
-        let size = 0;
-        for (const p of group) size += p.pcm.length;
-        blob = new Blob([wavHeader(size), ...group.map((p) => p.pcm)], { type: 'audio/wav' });
+        blob = new Blob([wavHeader(group.bytes), ...group.pcm], { type: 'audio/wav' });
       }
 
       job.bytes += blob.size;
@@ -470,13 +505,7 @@ async function runExport(job) {
       triggerDownload(blob, name);
 
       if (job.srt) {
-        const segments = [];
-        let offset = 0;
-        for (const p of group) {
-          if (p.text) segments.push({ text: p.text, start: offset, duration: p.seconds });
-          offset += p.seconds;
-        }
-        const srt = buildSrt(segments);
+        const srt = buildSrt(group.segments);
         if (srt) {
           const srtName = `${base}${suffix}.srt`;
           job.srtNames.push(srtName);
