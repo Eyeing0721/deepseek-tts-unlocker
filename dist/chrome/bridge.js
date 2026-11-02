@@ -6,7 +6,7 @@
 
 const KEY = '__ds_remote_feature_store_model';
 const SAMPLE_RATE = 24000;
-const BRIDGE_VERSION = 5;
+const BRIDGE_VERSION = 6;
 
 function token() {
   try { return JSON.parse(localStorage.getItem('userToken') || 'null')?.value || null; } catch { return null; }
@@ -185,8 +185,7 @@ function synthesizePcm(sessionId, messageId, ticket) {
   });
 }
 
-function wavHeader(dataSize) {
-  const channels = 1;
+function wavHeader(dataSize) {  const channels = 1;
   const bitsPerSample = 16;
   const blockAlign = channels * bitsPerSample / 8;
   const out = new Uint8Array(44);
@@ -245,6 +244,83 @@ function stampName() {
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
+/* ---------- SRT 字幕（配合导出的音频做视频） ---------- */
+function srtTime(sec) {
+  const ms = Math.max(0, Math.round(sec * 1000));
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  return `${pad(Math.floor(ms / 3600000))}:${pad(Math.floor((ms % 3600000) / 60000))}:${pad(Math.floor((ms % 60000) / 1000))},${pad(ms % 1000, 3)}`;
+}
+
+// 按句末标点断句，长句再按长度硬切，便于一屏读一行
+function splitCues(text, maxLen = 90) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const sentences = clean.match(/[^.!?…。！？]+[.!?…。！？]*/g) || [clean];
+  const cues = [];
+  let buf = '';
+  const push = (value) => {
+    let rest = value;
+    while (rest.length > maxLen) {
+      let cut = rest.lastIndexOf(' ', maxLen);
+      if (cut < maxLen / 2) cut = maxLen;
+      cues.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
+    }
+    if (rest) cues.push(rest);
+  };
+  for (const raw of sentences) {
+    const piece = raw.trim();
+    if (!piece) continue;
+    if (buf && buf.length + 1 + piece.length > maxLen) { push(buf); buf = piece; }
+    else buf = buf ? buf + ' ' + piece : piece;
+  }
+  if (buf) push(buf);
+  return cues.filter(Boolean);
+}
+
+function buildSrt(segments) {
+  let index = 1;
+  const blocks = [];
+  for (const seg of segments) {
+    const cues = splitCues(seg.text);
+    if (!cues.length) continue;
+    const totalChars = cues.reduce((n, c) => n + c.length, 0) || 1;
+    let t = seg.start;
+    for (const cue of cues) {
+      const dur = Math.max(0.4, seg.duration * (cue.length / totalChars));
+      blocks.push(`${index++}\n${srtTime(t)} --> ${srtTime(t + dur)}\n${cue}\n`);
+      t += dur;
+    }
+  }
+  return blocks.join('\n');
+}
+
+async function fetchTextMap(sessionId, tk) {
+  const map = new Map();
+  const add = (list) => {
+    for (const m of Array.isArray(list) ? list : []) {
+      const id = m && (m.message_id != null ? m.message_id : m.id);
+      if (id == null) continue;
+      const text = messageText(m).trim();
+      if (text) map.set(String(id), text);
+    }
+  };
+
+  try {
+    const res = await api('/api/v0/chat/history_messages?chat_session_id=' + encodeURIComponent(sessionId) + '&cache_version=0', {}, tk);
+    const biz = res && res.data && res.data.biz_data;
+    if (biz) add(biz.chat_messages || biz.messages);
+  } catch { /* 字幕是附加功能，失败就跳过 */ }
+
+  if (!map.size) {
+    try {
+      const recorded = await requestPageMessages();
+      if (recorded) add(recorded.messages);
+    } catch { /* 忽略 */ }
+  }
+  return map;
+}
+
 /* ---------- 导出任务：在页面里跑，弹窗关掉也不会中断 ---------- */
 const EXPORT_MAX_MESSAGES = 400;
 let currentJob = null;
@@ -259,6 +335,7 @@ function jobSnapshot(job) {
     seconds: Number(job.seconds.toFixed(1)),
     bytes: job.bytes,
     filename: job.filename,
+    srtName: job.srtName,
     error: job.error,
     code: job.code,
     cancelled: job.cancelled,
@@ -273,10 +350,13 @@ async function runExport(job) {
   let changed = false;
   const pcmParts = [];
   const mp3Parts = [];
+  const segments = [];
   let pcmBytes = 0;
+  let elapsed = 0;
 
   try {
     try { baseVoice = await readCurrentVoice(tk); } catch { baseVoice = null; }
+    const textMap = job.srt ? await fetchTextMap(job.sessionId, tk) : null;
 
     for (const item of job.items) {
       if (job.cancel) { job.cancelled = true; break; }
@@ -291,6 +371,11 @@ async function runExport(job) {
         job.seconds += seconds;
         if (job.format === 'mp3') mp3Parts.push(...encodeMp3Parts(pcm));
         else { pcmParts.push(pcm); pcmBytes += pcm.length; }
+        if (textMap) {
+          const text = textMap.get(item.id);
+          if (text) segments.push({ text, start: elapsed, duration: seconds });
+        }
+        elapsed += seconds;
       } catch (e) {
         const code = e && typeof e.code === 'number' ? e.code : null;
         job.skipped.push({ id: item.id, code, error: String((e && e.message) || e) });
@@ -319,9 +404,19 @@ async function runExport(job) {
       ext = 'wav';
     }
 
-    job.filename = `${job.prefix}-${stampName()}.${ext}`;
+    const base = `${job.prefix}-${stampName()}`;
+    job.filename = `${base}.${ext}`;
     job.bytes = blob.size;
     triggerDownload(blob, job.filename);
+
+    if (textMap && segments.length) {
+      const srt = buildSrt(segments);
+      if (srt) {
+        job.srtName = `${base}.srt`;
+        triggerDownload(new Blob([srt], { type: 'application/x-subrip' }), job.srtName);
+      }
+    }
+
     job.status = 'done';
   } finally {
     if (changed && baseVoice) {
@@ -524,6 +619,8 @@ ext.runtime.onMessage.addListener((msg, _sender, reply) => {
           items,
           format: msg.format === 'wav' ? 'wav' : 'mp3',
           prefix: msg.prefix === 'dialog' ? 'deepseek-dialog' : 'deepseek-tts',
+          srt: !!msg.srt,
+          srtName: null,
           status: 'running',
           done: 0,
           seconds: 0,

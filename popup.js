@@ -39,6 +39,7 @@ const state = {
   userVoice: null,
   audioFormat: 'mp3',
   wholeDialog: false,
+  subs: false,
   saving: false,
   granting: false,
   audio: null,
@@ -182,6 +183,7 @@ function loadSettings() {
     if (typeof saved.userVoice === 'string') state.userVoice = saved.userVoice;
     if (saved.audioFormat === 'wav' || saved.audioFormat === 'mp3') state.audioFormat = saved.audioFormat;
     state.wholeDialog = !!saved.wholeDialog;
+    state.subs = !!saved.subs;
   } catch { /* 设置损坏就回到默认 */ }
 }
 
@@ -194,6 +196,7 @@ function persistSettings() {
       userVoice: state.userVoice,
       audioFormat: state.audioFormat,
       wholeDialog: state.wholeDialog,
+      subs: state.subs,
     }));
   } catch { /* 存不了就只在本窗口生效 */ }
 }
@@ -351,8 +354,8 @@ function renderMsg() {
   el.innerHTML = body ? `<span class="${state.msg.cls}">${body}</span>` : '';
 }
 
-function setAudioMsg(key, vars, cls) {
-  state.audioMsg = { key, vars, cls: cls || 'muted' };
+function setAudioMsg(key, vars, cls, suffix) {
+  state.audioMsg = { key, vars, cls: cls || 'muted', suffix: suffix || '' };
 }
 
 function messageLabel(m) {
@@ -383,6 +386,7 @@ function renderAudioSection() {
   const info = $('audioInfo');
   const format = $('audioFormat');
   const whole = $('wholeDialog');
+  const srt = $('srt');
   const list = state.messages || [];
   const voices = state.voices && Array.isArray(state.voices.voices) ? state.voices.voices : [];
 
@@ -392,6 +396,8 @@ function renderAudioSection() {
   format.disabled = state.downloading;
   whole.checked = state.wholeDialog;
   whole.disabled = state.downloading || !list.length;
+  srt.checked = state.subs;
+  srt.disabled = state.downloading;
   cancel.hidden = !state.downloading;
   fillVoiceSelect($('assistantVoice'), state.assistantVoice, voices);
   fillVoiceSelect($('userVoice'), state.userVoice, voices);
@@ -435,7 +441,8 @@ function renderAudioMsg() {
   }
   const vars = {};
   for (const [key, value] of Object.entries(state.audioMsg.vars || {})) vars[key] = esc(value);
-  el.innerHTML = `<span class="${state.audioMsg.cls}">${t(state.audioMsg.key, vars)}</span>`;
+  const suffix = state.audioMsg.suffix ? ' · ' + state.audioMsg.suffix : '';
+  el.innerHTML = `<span class="${state.audioMsg.cls}">${t(state.audioMsg.key, vars)}${suffix}</span>`;
 }
 
 function render() {
@@ -656,9 +663,10 @@ async function pollExport(jobId) {
   if (job.status === 'done') {
     const sec = Number(job.seconds).toFixed(1);
     const size = formatSize(job.bytes);
-    if (job.cancelled) setAudioMsg('exportCancelled', { sec, size, done: job.done, total: job.total }, 'muted');
-    else if (job.skipped) setAudioMsg('dialogDoneSkipped', { sec, size, n: job.skipped }, 'ok');
-    else setAudioMsg('downloadDone', { sec, size }, 'ok');
+    const srtSuffix = job.srtName ? esc(t('srtSaved', { name: job.srtName })) : '';
+    if (job.cancelled) setAudioMsg('exportCancelled', { sec, size, done: job.done, total: job.total }, 'muted', srtSuffix);
+    else if (job.skipped) setAudioMsg('dialogDoneSkipped', { sec, size, n: job.skipped }, 'ok', srtSuffix);
+    else setAudioMsg('downloadDone', { sec, size }, 'ok', srtSuffix);
   } else {
     const key = ttsErrorKey(job.code);
     if (key) setAudioMsg(key, null, 'bad');
@@ -700,6 +708,7 @@ async function downloadAudio() {
     items,
     format: state.audioFormat,
     prefix: state.wholeDialog ? 'dialog' : 'single',
+    srt: state.subs,
   });
 
   if (!res || !res.ok) {
@@ -773,6 +782,12 @@ function bind() {
     renderAudioSection();
   });
 
+  $('srt').addEventListener('change', () => {
+    state.subs = $('srt').checked;
+    persistSettings();
+    renderAudioSection();
+  });
+
   $('save').onclick = saveVoice;
   $('preview').onclick = previewVoice;
   $('download').onclick = downloadAudio;
@@ -818,7 +833,7 @@ function bind() {
 
   state.mode = 'ready';
   state.st = st;
-  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 5);
+  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 6);
 
   const voicesRes = await send(tab.id, { type: 'voices' });
   state.voicesTried = true;
