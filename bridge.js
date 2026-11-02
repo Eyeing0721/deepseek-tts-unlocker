@@ -6,7 +6,7 @@
 
 const KEY = '__ds_remote_feature_store_model';
 const SAMPLE_RATE = 24000;
-const BRIDGE_VERSION = 4;
+const BRIDGE_VERSION = 5;
 
 function token() {
   try { return JSON.parse(localStorage.getItem('userToken') || 'null')?.value || null; } catch { return null; }
@@ -77,7 +77,7 @@ function mapMessageList(list) {
   return (Array.isArray(list) ? list : [])
     .map((m) => m && { m, id: m.message_id != null ? m.message_id : m.id })
     .filter((x) => x && x.id != null)
-    .slice(-40)
+    .slice(-400)
     .map(({ m, id }) => {
       const text = messageText(m).replace(/\s+/g, ' ').trim();
       return {
@@ -185,13 +185,152 @@ function synthesizePcm(sessionId, messageId, ticket) {
   });
 }
 
-function toBase64(bytes) {
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+function wavHeader(dataSize) {
+  const channels = 1;
+  const bitsPerSample = 16;
+  const blockAlign = channels * bitsPerSample / 8;
+  const out = new Uint8Array(44);
+  const view = new DataView(out.buffer);
+  const ascii = (offset, text) => {
+    for (let i = 0; i < text.length; i++) out[offset + i] = text.charCodeAt(i);
+  };
+  ascii(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, SAMPLE_RATE, true);
+  view.setUint32(28, SAMPLE_RATE * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  ascii(36, 'data');
+  view.setUint32(40, dataSize, true);
+  return out;
+}
+
+// 逐条编码：每段 MP3 帧都可以直接拼在一起播放，不必把整段 PCM 攒在内存里
+function encodeMp3Parts(pcm) {
+  if (typeof lamejs === 'undefined' || !lamejs.Mp3Encoder) throw new Error('mp3-encoder-missing');
+  const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+  const encoder = new lamejs.Mp3Encoder(1, SAMPLE_RATE, 128);
+  const parts = [];
+  const blockSize = 1152;
+  for (let i = 0; i < samples.length; i += blockSize) {
+    const buf = encoder.encodeBuffer(samples.subarray(i, i + blockSize));
+    if (buf.length) parts.push(new Uint8Array(buf));
   }
-  return btoa(binary);
+  const tail = encoder.flush();
+  if (tail.length) parts.push(new Uint8Array(tail));
+  return parts;
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* 忽略 */ } }, 120000);
+}
+
+function stampName() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+/* ---------- 导出任务：在页面里跑，弹窗关掉也不会中断 ---------- */
+const EXPORT_MAX_MESSAGES = 400;
+let currentJob = null;
+
+function jobSnapshot(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    total: job.items.length,
+    done: job.done,
+    skipped: job.skipped.length,
+    seconds: Number(job.seconds.toFixed(1)),
+    bytes: job.bytes,
+    filename: job.filename,
+    error: job.error,
+    code: job.code,
+    cancelled: job.cancelled,
+  };
+}
+
+async function runExport(job) {
+  const tk = token();
+  if (!tk) throw new Error('no-token');
+
+  let baseVoice = null;
+  let changed = false;
+  const pcmParts = [];
+  const mp3Parts = [];
+  let pcmBytes = 0;
+
+  try {
+    try { baseVoice = await readCurrentVoice(tk); } catch { baseVoice = null; }
+
+    for (const item of job.items) {
+      if (job.cancel) { job.cancelled = true; break; }
+      try {
+        const want = item.voiceId || baseVoice;
+        if (want && want !== knownVoice) {
+          if (!changed && baseVoice && !savedVoice()) savePendingVoice(baseVoice);
+          await applyVoice(tk, want);
+          changed = true;
+        }
+        const { pcm, seconds } = await downloadPcm(job.sessionId, item.id, tk);
+        job.seconds += seconds;
+        if (job.format === 'mp3') mp3Parts.push(...encodeMp3Parts(pcm));
+        else { pcmParts.push(pcm); pcmBytes += pcm.length; }
+      } catch (e) {
+        const code = e && typeof e.code === 'number' ? e.code : null;
+        job.skipped.push({ id: item.id, code, error: String((e && e.message) || e) });
+        // 额度用尽 / 无权限 / 服务不可用：后面的消息也不会成功，提前收尾
+        if (code === 4 || code === 9 || code === 11) { job.code = code; break; }
+      } finally {
+        job.done += 1;
+      }
+    }
+
+    if (!mp3Parts.length && !pcmParts.length) {
+      const first = job.skipped[0];
+      job.status = 'error';
+      job.code = first ? first.code : null;
+      job.error = job.cancelled ? 'cancelled' : (first ? first.error : 'no audio');
+      return;
+    }
+
+    let blob;
+    let ext;
+    if (job.format === 'mp3') {
+      blob = new Blob(mp3Parts, { type: 'audio/mpeg' });
+      ext = 'mp3';
+    } else {
+      blob = new Blob([wavHeader(pcmBytes), ...pcmParts], { type: 'audio/wav' });
+      ext = 'wav';
+    }
+
+    job.filename = `${job.prefix}-${stampName()}.${ext}`;
+    job.bytes = blob.size;
+    triggerDownload(blob, job.filename);
+    job.status = 'done';
+  } finally {
+    if (changed && baseVoice) {
+      try {
+        await applyVoice(tk, baseVoice);
+        savePendingVoice(null);
+      } catch { knownVoice = null; }
+    }
+  }
 }
 
 /* ---------- 按角色切换音色（下载对话时用） ---------- */
@@ -280,7 +419,7 @@ async function downloadPcm(sessionId, messageId, tk) {
     pcm.set(chunk, offset);
     offset += chunk.length;
   }
-  return { audio: toBase64(pcm), bytes: pcm.length, seconds: total / 2 / SAMPLE_RATE };
+  return { pcm, seconds: total / 2 / SAMPLE_RATE };
 }
 
 // 跨浏览器：Firefox 用 browser.*（Promise），Chrome/Edge 用 chrome.*
@@ -365,28 +504,52 @@ ext.runtime.onMessage.addListener((msg, _sender, reply) => {
           console.debug('[ds-tts] history_messages：', messages.length, '条');
         }
         done({ ok: true, data: { sessionId, messages, total, keys } });
-      } else if (msg.type === 'download') {
+      } else if (msg.type === 'exportStart') {
         const sessionId = sessionIdFromUrl();
         if (!sessionId) { done({ ok: false, error: 'no-session' }); return; }
         if (!tk) { done({ ok: false, error: 'no-token' }); return; }
-        if (!msg.messageId) { done({ ok: false, error: 'no-message' }); return; }
+        if (currentJob && currentJob.status === 'running') {
+          done({ ok: false, error: 'busy' });
+          return;
+        }
+        const items = (Array.isArray(msg.items) ? msg.items : [])
+          .filter((x) => x && x.id != null)
+          .slice(0, EXPORT_MAX_MESSAGES)
+          .map((x) => ({ id: String(x.id), voiceId: x.voiceId || null }));
+        if (!items.length) { done({ ok: false, error: 'no-message' }); return; }
 
-        const current = await readCurrentVoice(tk);
-        const want = msg.voiceId || current;
-        let switched = false;
-        if (want && current && want !== current) {
-          await applyVoice(tk, want);
-          switched = true;
-          if (msg.keepVoice && !savedVoice()) savePendingVoice(current);
+        currentJob = {
+          id: 'job' + Date.now().toString(36),
+          sessionId,
+          items,
+          format: msg.format === 'wav' ? 'wav' : 'mp3',
+          prefix: msg.prefix === 'dialog' ? 'deepseek-dialog' : 'deepseek-tts',
+          status: 'running',
+          done: 0,
+          seconds: 0,
+          skipped: [],
+          bytes: 0,
+          filename: null,
+          error: null,
+          code: null,
+          cancel: false,
+          cancelled: false,
+        };
+        done({ ok: true, data: jobSnapshot(currentJob) });
+        runExport(currentJob).catch((e) => {
+          currentJob.status = 'error';
+          currentJob.error = String((e && e.message) || e);
+          currentJob.code = e && typeof e.code === 'number' ? e.code : null;
+        });
+      } else if (msg.type === 'exportStatus') {
+        if (currentJob && (!msg.jobId || msg.jobId === currentJob.id)) {
+          done({ ok: true, data: jobSnapshot(currentJob) });
+        } else {
+          done({ ok: true, data: null });
         }
-        try {
-          const data = await downloadPcm(sessionId, msg.messageId, tk);
-          done({ ok: true, data: { ...data, voice: want || current || null } });
-        } finally {
-          if (switched && !msg.keepVoice) {
-            try { await applyVoice(tk, current); } catch { knownVoice = null; }
-          }
-        }
+      } else if (msg.type === 'exportCancel') {
+        if (currentJob && currentJob.status === 'running') currentJob.cancel = true;
+        done({ ok: true, data: currentJob ? jobSnapshot(currentJob) : null });
       } else if (msg.type === 'restoreVoice') {
         if (!tk) { done({ ok: true, data: { voice: null } }); return; }
         done({ ok: true, data: { voice: await restoreSavedVoice(tk) } });

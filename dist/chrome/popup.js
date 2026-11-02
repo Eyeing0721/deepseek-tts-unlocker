@@ -32,6 +32,7 @@ const state = {
   messagesEmpty: false,
   selectedMessage: null,
   downloading: false,
+  exportJob: null,
   audioMsg: null,
   selectedVoice: null,
   assistantVoice: null,
@@ -83,82 +84,9 @@ function shortJson(value) {
   return String(out ?? '').slice(0, 160);
 }
 
-function base64ToBytes(b64) {
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-function saveBlob(blob, name) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
-}
-
 function formatSize(bytes) {
   if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
   return Math.max(1, Math.round(bytes / 1024)) + ' KB';
-}
-
-function pcmToWavBytes(pcm, sampleRate = 24000, channels = 1, bitsPerSample = 16) {
-  const blockAlign = channels * bitsPerSample / 8;
-  const dataSize = pcm.length - (pcm.length % blockAlign);
-  const out = new Uint8Array(44 + dataSize);
-  const view = new DataView(out.buffer);
-  const ascii = (offset, text) => {
-    for (let i = 0; i < text.length; i++) out[offset + i] = text.charCodeAt(i);
-  };
-  ascii(0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  ascii(8, 'WAVE');
-  ascii(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, channels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-  ascii(36, 'data');
-  view.setUint32(40, dataSize, true);
-  out.set(pcm.subarray(0, dataSize), 44);
-  return out;
-}
-
-function concatPcm(chunks, silenceMs = 500) {
-  const silence = new Uint8Array(Math.round(24000 * 2 * silenceMs / 1000));
-  let total = 0;
-  chunks.forEach((chunk, i) => { total += chunk.length + (i ? silence.length : 0); });
-  const out = new Uint8Array(total);
-  let offset = 0;
-  chunks.forEach((chunk, i) => {
-    if (i) { out.set(silence, offset); offset += silence.length; }
-    out.set(chunk, offset);
-    offset += chunk.length;
-  });
-  return out;
-}
-
-function encodeMp3(pcmBytes) {
-  if (typeof lamejs === 'undefined' || !lamejs.Mp3Encoder) throw new Error('MP3 encoder is not loaded');
-  const samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, Math.floor(pcmBytes.byteLength / 2));
-  const encoder = new lamejs.Mp3Encoder(1, 24000, 128);
-  const blockSize = 1152;
-  const chunks = [];
-  for (let i = 0; i < samples.length; i += blockSize) {
-    const buf = encoder.encodeBuffer(samples.subarray(i, i + blockSize));
-    if (buf.length) chunks.push(new Uint8Array(buf));
-  }
-  const tail = encoder.flush();
-  if (tail.length) chunks.push(new Uint8Array(tail));
-  return new Blob(chunks, { type: 'audio/mpeg' });
 }
 
 /* ---------- 语音元数据 ---------- */
@@ -450,6 +378,7 @@ function fillVoiceSelect(select, value, list) {
 function renderAudioSection() {
   const sel = $('message');
   const btn = $('download');
+  const cancel = $('cancelExport');
   const reload = $('reloadPage');
   const info = $('audioInfo');
   const format = $('audioFormat');
@@ -463,6 +392,7 @@ function renderAudioSection() {
   format.disabled = state.downloading;
   whole.checked = state.wholeDialog;
   whole.disabled = state.downloading || !list.length;
+  cancel.hidden = !state.downloading;
   fillVoiceSelect($('assistantVoice'), state.assistantVoice, voices);
   fillVoiceSelect($('userVoice'), state.userVoice, voices);
 
@@ -677,12 +607,6 @@ function roleVoiceFor(role) {
   return null;
 }
 
-function timestampName() {
-  const now = new Date();
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-}
-
 function ttsErrorKey(code) {
   if (typeof code !== 'number') return null;
   const key = 'ttsError' + code;
@@ -690,98 +614,108 @@ function ttsErrorKey(code) {
   return dict[key] != null ? key : null;
 }
 
-async function downloadAudio() {
-  if (!state.tab || state.downloading) return;
-  const all = Array.isArray(state.messages) ? state.messages : [];
-  const single = all.find((m) => m.id === state.selectedMessage) || null;
-  const items = state.wholeDialog ? all.slice(-20) : (single ? [single] : []);
-  if (!items.length) return;
+let exportTimer = null;
 
-  const whole = state.wholeDialog;
-  const format = state.audioFormat === 'wav' ? 'wav' : 'mp3';
-  state.downloading = true;
-  stopAudio();
-  setAudioMsg(whole ? 'downloadProgress' : 'keepOpen', whole ? { done: 0, total: items.length } : null);
-  renderAudioSection();
-  renderAudioMsg();
+function stopExportPolling() {
+  if (exportTimer) clearTimeout(exportTimer);
+  exportTimer = null;
+}
 
-  const chunks = [];
-  const skipped = [];
-  let totalSeconds = 0;
-  let lastError = null;
-
-  try {
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (whole) {
-        setAudioMsg('downloadProgress', { done: i, total: items.length }, 'muted');
-        renderAudioMsg();
-      }
-      const res = await send(state.tab.id, {
-        type: 'download',
-        messageId: item.id,
-        voiceId: roleVoiceFor(item.role) || undefined,
-        keepVoice: true,
-      });
-      if (res && res.ok && res.data && res.data.audio) {
-        chunks.push(base64ToBytes(res.data.audio));
-        totalSeconds += Number(res.data.seconds || 0);
-      } else {
-        lastError = res;
-        skipped.push(item.id);
-        if (!whole) break;
-      }
-      if (whole && i < items.length - 1) await new Promise((r) => setTimeout(r, 120));
-    }
-  } finally {
-    try { await send(state.tab.id, { type: 'restoreVoice' }); } catch { /* 忽略 */ }
-  }
-
-  state.downloading = false;
-
-  if (!chunks.length) {
-    const key = ttsErrorKey(lastError && lastError.code);
-    if (key) setAudioMsg(key, null, 'bad');
-    else setAudioMsg('downloadFailed', { err: shortJson((lastError && lastError.error) || lastError || 'empty') }, 'bad');
+async function pollExport(jobId) {
+  if (!state.tab) return;
+  const res = await send(state.tab.id, { type: 'exportStatus', jobId });
+  if (!res || !res.ok) {
+    state.downloading = false;
+    stopExportPolling();
+    setAudioMsg('downloadFailed', { err: shortJson((res && res.error) || res) }, 'bad');
     renderAudioSection();
     renderAudioMsg();
     return;
   }
 
-  try {
-    const pcm = concatPcm(chunks);
-    let blob;
-    let ext;
-    if (format === 'wav') {
-      blob = new Blob([pcmToWavBytes(pcm)], { type: 'audio/wav' });
-      ext = 'wav';
-    } else {
-      setAudioMsg('mp3Encoding');
-      renderAudioMsg();
-      await new Promise((r) => setTimeout(r, 30));
-      blob = encodeMp3(pcm);
-      ext = 'mp3';
-    }
-    const prefix = whole ? 'deepseek-dialog' : 'deepseek-tts';
-    saveBlob(blob, `${prefix}-${timestampName()}.${ext}`);
-    if (skipped.length) {
-      setAudioMsg('dialogDoneSkipped', {
-        sec: totalSeconds.toFixed(1),
-        size: formatSize(blob.size),
-        n: skipped.length,
-      }, 'ok');
-    } else {
-      setAudioMsg('downloadDone', {
-        sec: totalSeconds.toFixed(1),
-        size: formatSize(blob.size),
-      }, 'ok');
-    }
-  } catch (e) {
-    setAudioMsg('downloadFailed', { err: shortJson((e && e.message) || e) }, 'bad');
+  const job = res.data;
+  if (!job) {
+    state.downloading = false;
+    stopExportPolling();
+    renderAudioSection();
+    return;
+  }
+
+  state.exportJob = job;
+  if (job.status === 'running') {
+    setAudioMsg('downloadProgress', { done: job.done, total: job.total }, 'muted');
+    renderAudioSection();
+    renderAudioMsg();
+    exportTimer = setTimeout(() => pollExport(jobId), 800);
+    return;
+  }
+
+  state.downloading = false;
+  stopExportPolling();
+
+  if (job.status === 'done') {
+    const sec = Number(job.seconds).toFixed(1);
+    const size = formatSize(job.bytes);
+    if (job.cancelled) setAudioMsg('exportCancelled', { sec, size, done: job.done, total: job.total }, 'muted');
+    else if (job.skipped) setAudioMsg('dialogDoneSkipped', { sec, size, n: job.skipped }, 'ok');
+    else setAudioMsg('downloadDone', { sec, size }, 'ok');
+  } else {
+    const key = ttsErrorKey(job.code);
+    if (key) setAudioMsg(key, null, 'bad');
+    else if (job.error === 'mp3-encoder-missing') setAudioMsg('bridgeOutdated', null, 'bad');
+    else if (job.error === 'cancelled') setAudioMsg('exportCancelled', { sec: '0', size: formatSize(0), done: job.done, total: job.total }, 'muted');
+    else setAudioMsg('downloadFailed', { err: shortJson(job.error || 'unknown') }, 'bad');
   }
 
   renderAudioSection();
   renderAudioMsg();
+}
+
+async function cancelExport() {
+  if (!state.tab || !state.exportJob) return;
+  setAudioMsg('cancelling');
+  renderAudioMsg();
+  await send(state.tab.id, { type: 'exportCancel', jobId: state.exportJob.id });
+}
+
+async function downloadAudio() {
+  if (!state.tab || state.downloading) return;
+  const all = Array.isArray(state.messages) ? state.messages : [];
+  const single = all.find((m) => m.id === state.selectedMessage) || null;
+  const list = state.wholeDialog ? all : (single ? [single] : []);
+  if (!list.length) return;
+
+  const items = list.map((m) => ({ id: m.id, voiceId: roleVoiceFor(m.role) || null }));
+
+  state.downloading = true;
+  state.exportJob = null;
+  stopAudio();
+  stopExportPolling();
+  setAudioMsg('downloadProgress', { done: 0, total: items.length }, 'muted');
+  renderAudioSection();
+  renderAudioMsg();
+
+  const res = await send(state.tab.id, {
+    type: 'exportStart',
+    items,
+    format: state.audioFormat,
+    prefix: state.wholeDialog ? 'dialog' : 'single',
+  });
+
+  if (!res || !res.ok) {
+    state.downloading = false;
+    const key = ttsErrorKey(res && res.code);
+    if (key) setAudioMsg(key, null, 'bad');
+    else if (res && res.error === 'no-token') setAudioMsg('needLogin', null, 'bad');
+    else if (res && res.error === 'busy') setAudioMsg('exportBusy', null, 'bad');
+    else setAudioMsg('downloadFailed', { err: shortJson((res && res.error) || res) }, 'bad');
+    renderAudioSection();
+    renderAudioMsg();
+    return;
+  }
+
+  state.exportJob = res.data;
+  pollExport(res.data && res.data.id);
 }
 
 /* ---------- 事件 ---------- */
@@ -842,6 +776,7 @@ function bind() {
   $('save').onclick = saveVoice;
   $('preview').onclick = previewVoice;
   $('download').onclick = downloadAudio;
+  $('cancelExport').onclick = cancelExport;
   $('reloadPage').onclick = reloadPage;
   $('reset').onclick = resetCache;
   $('grant').onclick = grantAccess;
@@ -883,7 +818,7 @@ function bind() {
 
   state.mode = 'ready';
   state.st = st;
-  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 4);
+  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 5);
 
   const voicesRes = await send(tab.id, { type: 'voices' });
   state.voicesTried = true;
@@ -916,5 +851,15 @@ function bind() {
   } else {
     await loadMessages(tab.id);
   }
+
+  // 弹窗上一次关掉时可能还有导出任务在跑：接着显示进度
+  const jobRes = await send(tab.id, { type: 'exportStatus' });
+  if (jobRes && jobRes.ok && jobRes.data && jobRes.data.status === 'running') {
+    state.downloading = true;
+    state.exportJob = jobRes.data;
+    state.wholeDialog = jobRes.data.total > 1;
+    pollExport(jobRes.data.id);
+  }
+
   render();
 })();

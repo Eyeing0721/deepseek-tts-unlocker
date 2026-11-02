@@ -122,10 +122,10 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 | 文件 | 作用 |
 |---|---|
 | `inject.js` | 主世界、`document_start` 注入，包一层 `Storage.prototype.getItem`：读到配置缓存时给每个模型补 `tts_feature`，并把 `remoteVersion` 在内存里抬高 1000 挡住服务端覆盖；`setItem` 里再减回去，磁盘保持官方原值。另外顺手截获官方前端自己请求的 `history_messages`，给下载列表做兜底。**Chrome 和 Firefox 共用同一份。** |
-| `bridge.js` | 隔离世界脚本，读同源 `localStorage.userToken`，代弹窗调用 `/api/v0/chat/tts/voices`、`/api/v0/chat/tts/voice`、`/api/v0/auth/ticket`、`/api/v0/chat/history_messages`；导出音频时直接连官方 TTS WebSocket 收 PCM，并按角色临时切换/恢复音色。 |
-| `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色、选择界面语言与朗读语言（含官方试听）、下载 MP3/WAV、按「DeepSeek / 你」分配音色、整段对话合成。Firefox 下还会检查站点权限并提供一键授权。 |
+| `bridge.js` | 隔离世界脚本，读同源 `localStorage.userToken`，代弹窗调用 `/api/v0/chat/tts/voices`、`/api/v0/chat/tts/voice`、`/api/v0/auth/ticket`、`/api/v0/chat/history_messages`；导出的任务（逐条合成、MP3/WAV 编码、保存文件）都在这里跑，弹窗关掉也不中断。 |
+| `popup.html/js` | 状态面板：注入是否生效、账号本来有没有被灰度到、切换朗读音色、选择界面语言与朗读语言（含官方试听）、下载 MP3/WAV、按「DeepSeek / 你」分配音色、整段对话合成（含进度与取消）。Firefox 下还会检查站点权限并提供一键授权。 |
 | `i18n.js` | 弹窗文案表（中文 / English / Русский）与音色名称、描述的兜底翻译。加一门界面语言只需在这里加一项。 |
-| `lamejs.min.js` | 内置 MP3 编码器（lamejs 1.2.1，LGPL-3.0，未修改，可独立替换）。许可证见 `LICENSE-lamejs.txt`。 |
+| `lamejs.min.js` | 内置 MP3 编码器（lamejs 1.2.1，LGPL-3.0，未修改，可独立替换），作为 content script 注入。许可证见 `LICENSE-lamejs.txt`。 |
 | `_locales/` | 清单本地化（`zh_CN` / `en` / `ru`，默认 `en`），让浏览器工具栏和商店里的扩展名称、描述跟随浏览器语言。 |
 | `manifest.json` | Chrome / Edge 的清单（MV3）。 |
 | `manifest.firefox.json` | Firefox 的清单（MV3 + `browser_specific_settings`），比 Chrome 版多一个 `optional_host_permissions` 用于运行时授权。 |
@@ -146,7 +146,7 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 
 ### 下载音频（MP3 / WAV，按角色配音）
 
-弹窗里的「下载音频」区块会从 `/api/v0/chat/history_messages` 读取当前会话最近 40 条消息。
+弹窗里的「下载音频」区块会从 `/api/v0/chat/history_messages` 读取当前会话最近 400 条消息。
 读取时兼容当前接口的 `fragments[].content`（正文在 fragment 里，消息级 `content` 是老格式），
 并带 `cache_version=0` 强制拿全量快照，避免服务端返回 `MERGE` 增量（0 条）。
 如果插件直连接口没拿到消息（比如官方接口参数变了），会自动改用**官方前端自己请求的那份历史**
@@ -158,11 +158,18 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 浏览器扩展运行在沙箱里，无法调用系统安装的 `ffmpeg`，所以这里直接内置了 MP3 编码器，
 不需要任何外部程序。
 
+**长对话**：导出在页面的 content-script 里执行，不在弹窗里：
+
+- 弹窗可以关掉，任务会继续跑，文件自己保存；
+- 进度显示「正在合成 N/M…」，旁边有「取消」按钮（已合成的部分仍会保存）；
+- MP3 按条即时编码，内存占用不随对话长度增长；
+- 消息列表取全部（最多最近 400 条），不再是 20 条；
+- 遇到额度用尽（错误码 4）会停下，已合成的部分照常保存。
+
 **两种音色**：区块里有两个音色下拉框——「DeepSeek」和「你」。
-单条下载会按消息角色自动选对应音色；勾选「整个对话」则把当前列表里最近 20 条消息依次合成，
-消息之间插 0.5 秒静音，最后生成一个文件。切换音色用 `POST /api/v0/chat/tts/voice`，
-全部结束后会把账号原来的音色恢复；如果弹窗中途被关掉，下次页面加载也会自动恢复。
-整个对话会消耗较多朗读额度，建议先单条试一下。
+单条下载会按消息角色自动选对应音色；勾选「整个对话」则把所有消息依次合成（首尾相接）。
+切换音色用 `POST /api/v0/chat/tts/voice`，结束后会把账号原来的音色恢复；
+如果导出途中页面被关掉，下次加载页面也会恢复。整个对话会消耗较多朗读额度。
 
 > 更新插件后记得**刷新一次 DeepSeek 标签页**：已打开的页面里仍然跑着旧的 content script，
 > 弹窗会显示「需要刷新页面」并给出刷新按钮（`bridge.js` 通过 `bridgeVersion` 自检版本）。
@@ -187,7 +194,8 @@ javascript:(()=>{localStorage.removeItem('__ds_remote_feature_store_model');loca
 - `ticket` 是一次性的、600 秒有效；官方前端每轮连接都重新取票，插件不碰这部分。
 - 「下载音频」和官方朗读走同一个 TTS 接口，同样消耗朗读额度、受频率限制；
   额度用完 / 频率过高 / 音色不支持该语言时，弹窗里会直接给出对应提示。
-- 「整个对话」是逐条请求：N 条消息会合成 N 次，耗时和额度消耗都按条累加。
+- 「整个对话」是逐条请求：N 条消息会合成 N 次，耗时和额度消耗都按条累加；
+  单条超长回答受服务端 TTS 单次时长限制，必要时会在结果里显示为跳过。
 - 这是灰测功能的接口，官方随时可能改协议或加服务端校验；届时插件可能需要更新。
 
 ## 六、音色对照（实测）
