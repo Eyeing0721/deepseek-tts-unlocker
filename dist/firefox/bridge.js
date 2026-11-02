@@ -6,7 +6,7 @@
 
 const KEY = '__ds_remote_feature_store_model';
 const SAMPLE_RATE = 24000;
-const BRIDGE_VERSION = 6;
+const BRIDGE_VERSION = 7;
 
 function token() {
   try { return JSON.parse(localStorage.getItem('userToken') || 'null')?.value || null; } catch { return null; }
@@ -353,6 +353,8 @@ function jobSnapshot(job) {
     srtName: job.srtName,
     files: job.files,
     srtCount: job.srtNames ? job.srtNames.length : 0,
+    filenames: job.filenames ? job.filenames.slice(0, 100) : [],
+    srtFiles: job.srtNames ? job.srtNames.slice(0, 100) : [],
     error: job.error,
     code: job.code,
     cancelled: job.cancelled,

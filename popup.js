@@ -254,12 +254,13 @@ function renderStatus() {
   gray.textContent = '';
 
   const extVersion = (() => {
-    try { return api.runtime.getManifest().version; } catch { return '?'; }
+    try { return api.runtime.getManifest().version; } catch { return null; }
   })();
   const bridgeVersion = state.st && typeof state.st.bridgeVersion === 'number' ? state.st.bridgeVersion : null;
-  build.textContent = bridgeVersion != null
-    ? `v${extVersion} · bridge v${bridgeVersion}`
-    : `v${extVersion}`;
+  build.textContent = [
+    extVersion ? `v${extVersion}` : null,
+    bridgeVersion != null ? `bridge v${bridgeVersion}` : null,
+  ].filter(Boolean).join(' · ');
 
   if (state.mode === 'checking') {
     dot.className = 'dot';
@@ -414,6 +415,11 @@ function renderAudioSection() {
   srt.disabled = state.downloading;
   split.value = String(state.split);
   split.disabled = state.downloading;
+  const cmd = ffmpegCommand(state.exportJob);
+  const ffmpegBtn = $('ffmpegCmd');
+  ffmpegBtn.hidden = !cmd;
+  ffmpegBtn.disabled = state.downloading;
+  ffmpegBtn.title = cmd || '';
   cancel.hidden = !state.downloading;
   fillVoiceSelect($('assistantVoice'), state.assistantVoice, voices);
   fillVoiceSelect($('userVoice'), state.userVoice, voices);
@@ -630,8 +636,7 @@ function roleVoiceFor(role) {
   return null;
 }
 
-function ttsErrorKey(code) {
-  if (typeof code !== 'number') return null;
+function ttsErrorKey(code) {  if (typeof code !== 'number') return null;
   const key = 'ttsError' + code;
   const dict = I18N[state.uiLang] || I18N.en;
   return dict[key] != null ? key : null;
@@ -707,6 +712,45 @@ async function cancelExport() {
   setAudioMsg('cancelling');
   renderAudioMsg();
   await send(state.tab.id, { type: 'exportCancel', jobId: state.exportJob.id });
+}
+
+// 扩展不能自己启动 ffmpeg，但可以生成现成命令，复制到终端即可
+function ffmpegCommand(job) {
+  if (!job) return '';
+  const files = Array.isArray(job.filenames) ? job.filenames : [];
+  if (files.length > 1) {
+    const inputs = files.map((f) => `-i "${f}"`).join(' ');
+    return `ffmpeg ${inputs} -filter_complex "concat=n=${files.length}:v=0:a=1" -c:a libmp3lame -b:a 192k merged.mp3`;
+  }
+  const audio = files[0];
+  const srt = Array.isArray(job.srtFiles) ? job.srtFiles[0] : null;
+  if (audio && srt) {
+    return `ffmpeg -f lavfi -i color=c=0x111111:s=1280x720:r=30 -i "${audio}" -vf "subtitles=${srt}:force_style='FontName=DejaVu Sans,FontSize=28'" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest out.mp4`;
+  }
+  return '';
+}
+
+async function copyFfmpegCommand() {
+  const cmd = ffmpegCommand(state.exportJob);
+  if (!cmd) return;
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(cmd);
+    ok = true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = cmd;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      ta.remove();
+    } catch { ok = false; }
+  }
+  setAudioMsg(ok ? 'cmdCopied' : 'cmdFailed', ok ? null : { err: 'clipboard' }, ok ? 'ok' : 'bad');
+  renderAudioMsg();
 }
 
 async function downloadAudio() {
@@ -822,6 +866,7 @@ function bind() {
   $('save').onclick = saveVoice;
   $('preview').onclick = previewVoice;
   $('download').onclick = downloadAudio;
+  $('ffmpegCmd').onclick = copyFfmpegCommand;
   $('cancelExport').onclick = cancelExport;
   $('reloadPage').onclick = reloadPage;
   $('reset').onclick = resetCache;
@@ -864,7 +909,7 @@ function bind() {
 
   state.mode = 'ready';
   state.st = st;
-  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 6);
+  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 7);
 
   const voicesRes = await send(tab.id, { type: 'voices' });
   state.voicesTried = true;
